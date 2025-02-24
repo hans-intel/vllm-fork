@@ -2446,6 +2446,13 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                                             dtype=model_input.input_tokens.dtype)
                 model_input.input_tokens.index_copy_(0, target_indices, self.cached_step_outputs[i])
                 htorch.core.mark_step()
+        elif use_delayed_sampling and model_input.is_prompt and self.is_driver_worker:
+            # WA to have delayed sampling with step0 first token
+            # TODO: find a better fix
+            num_cached = len(self.cached_step_outputs)
+            for i in range(num_cached):
+                self.cached_step_outputs.pop()
+                self.cached_step_inputs.pop()
 
         if not model_input.is_first_multi_step:
             if not model_input.is_last_step:
