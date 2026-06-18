@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -13,6 +14,1191 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
+
+try:
+    from vllm.triton_utils import tl, triton
+except ImportError as e:
+    logger.debug("Import error msg: %s", e)
+
+USE_TRITON_XPU_ATTN = os.environ.get("VLLM_USE_TRITON_XPU_ATTN", "0") == "1"
+
+if USE_TRITON_XPU_ATTN:
+    torch._dynamo.config.recompile_limit = 16
+
+
+@triton.jit
+def fp8_e4m3_to_fp16(x):
+    # x is fp8 casted to uint8 before function call
+    x_i8 = x.to(tl.uint16)
+    sign = (x_i8 & 0x80) << 8
+    payload = (x_i8 & 0x7F) << 7
+    unscaled_i16 = sign | payload
+    result = unscaled_i16.to(tl.float16, bitcast=True)
+    # Rebias exponent from e4m3 to fp16
+    result *= 256.0
+    return result
+
+
+@triton.jit
+def fp8_e4m3_to_bf16(x):
+    x_i8 = x.to(tl.uint16)
+    sign = (x_i8 & 0x80) << 8
+    payload = (x_i8 & 0x7F) << 4
+    unscaled_i16 = sign | payload
+    result = unscaled_i16.to(tl.bfloat16, bitcast=True)
+    # Rebias exponent from e4m3 to bf16. Same as fp32
+    result *= 2.0**120
+    return result
+
+
+@triton.jit
+def fp8_e5m2_to_fp16(x):
+    x_i8 = x.to(tl.uint16)
+    unscaled_i16 = (x_i8 & 0xFF) << 8
+    result = unscaled_i16.to(tl.float16, bitcast=True)
+    # No rebias needed
+    return result
+
+
+@triton.jit
+def fp8_e5m2_to_bf16(x):
+    x_i8 = x.to(tl.uint16)
+    sign = (x_i8 & 0x80) << 8
+    payload = (x_i8 & 0x7F) << 5
+    unscaled_i16 = sign | payload
+    result = unscaled_i16.to(tl.bfloat16, bitcast=True)
+    # Rebias exponent from e5m2 to bf16
+    result *= 2.0**112
+    return result
+
+
+@triton.jit
+def fp8_e4m3_to_fp32(x):
+    x_i8 = x.to(tl.uint32)
+    sign = (x_i8 & 0x80) << 24
+    payload = (x_i8 & 0x7F) << 20
+    unscaled_f32 = (sign | payload).to(tl.float32, bitcast=True)
+    # Rebias exponent from e4m3 to fp32
+    result = unscaled_f32 * (2.0**120)
+    return result
+
+
+@triton.jit
+def fp8_e5m2_to_fp32(x):
+    x_f8 = x.to(tl.float8e5, bitcast=True)
+    result = x_f8.to(tl.float32)
+    return result
+
+
+@triton.jit
+def convert_to_dtype(x, src_dtype: tl.constexpr, target_dtype: tl.constexpr):
+    if src_dtype == tl.float8e4nv:  # float8_e4m3fn
+        if target_dtype == tl.float16:
+            return fp8_e4m3_to_fp16(x)
+        elif target_dtype == tl.bfloat16:
+            return fp8_e4m3_to_bf16(x)
+        else:
+            return fp8_e4m3_to_fp32(x).to(target_dtype)
+    elif src_dtype == tl.float8e5:  # float8_e5m2
+        if target_dtype == tl.float16:
+            # Yes, this is faster than direct conversion
+            # No, I don't know why
+            return fp8_e5m2_to_bf16(x).to(tl.float16)
+        elif target_dtype == tl.bfloat16:
+            return fp8_e5m2_to_bf16(x)
+        else:
+            return fp8_e5m2_to_fp32(x).to(target_dtype)
+    elif target_dtype == tl.bfloat16:
+        if src_dtype == target_dtype:
+            return x
+        else:
+            return x.to(src_dtype, bitcast=True).to(tl.float32).to(tl.bfloat16)
+    else:
+        return x.to(src_dtype, bitcast=True).to(target_dtype)
+
+
+@triton.jit
+def _fwd_grouped_kernel_decode(
+    # Input/Output Tensors
+    Output,
+    Query,
+    K_Buffer,
+    V_Buffer,
+    KEY_SCRATCH,
+    VALUE_SCRATCH,
+    Req_to_tokens,
+    cu_seqlens_q,
+    seqused_k,
+    flat_offset,
+    Flat_Att_Out,
+    Flat_Att_Single,
+    num_splits,
+    num_splits_real,
+    # Parameters
+    sm_scale,
+    num_decodes,
+    total_active_tasks,
+    # Strides for tensor access
+    stride_req_to_tokens_b: tl.constexpr,
+    stride_qbs: tl.constexpr,
+    stride_qh: tl.constexpr,
+    stride_buf_kbs: tl.constexpr,
+    stride_buf_kh: tl.constexpr,
+    stride_buf_vbs: tl.constexpr,
+    stride_buf_vh: tl.constexpr,
+    stride_buf_kblock: tl.constexpr,
+    stride_buf_vblock: tl.constexpr,
+    # KV scales
+    k_scale,
+    v_scale,
+    # sink
+    sink,
+    USE_SINKS: tl.constexpr,
+    # Constexprs for kernel specialization
+    window_size_left: tl.constexpr,
+    kv_group_num: tl.constexpr,
+    q_block_head: tl.constexpr,
+    num_heads_kv: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    BLOCK_Q: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    Lk: tl.constexpr,
+    Lv: tl.constexpr,
+    # Autotune parameters
+    BLOCK_N: tl.constexpr = 16,
+    BLOCK_DMODEL_SLICE: tl.constexpr = 8,
+    BLOCKS_PER_SPLIT: tl.constexpr = 1,
+):
+    """
+    Stage 1 Kernel using static mapping. Each block processes one task.
+    It reads task info from Task_metadata and writes its partial result
+    to a unique slot in the flat Flat_Att_Out buffer.
+    """
+    task_id = tl.program_id(0)
+    if task_id >= total_active_tasks:
+        return
+
+    cur_batch = task_id // (num_heads_kv * num_splits)
+    cur_head = task_id % (num_heads_kv * num_splits) // num_splits
+    cur_split = task_id % num_splits
+
+    cur_batch_seq_len = tl.load(seqused_k + cur_batch)
+    # This is where the current q starts in the batch
+    cur_q_start = tl.load(cu_seqlens_q + cur_batch)
+
+    seq_len_q = tl.load(cu_seqlens_q + cur_batch + 1) - tl.load(
+        cu_seqlens_q + cur_batch
+    )
+
+    # Perform dequant for prompt pass in decode mode
+    perform_dequant = False
+
+    if seq_len_q > 1:
+        # Decrement num_decodes for the prompt kernel
+        if (cur_head == 0) and (cur_split == 0):
+            tl.atomic_min(num_decodes, cur_batch)
+        if K_Buffer.dtype.element_ty != Query.dtype.element_ty:
+            perform_dequant = True
+        else:
+            # Early exit for prompt tokens
+            return
+
+    seq_start = 0
+    if window_size_left > 0:
+        seq_start = tl.maximum(0, cur_batch_seq_len - window_size_left - 1)
+        seq_start = (seq_start // PAGE_SIZE) * PAGE_SIZE
+
+    split_start = seq_start + cur_split * PAGE_SIZE * BLOCKS_PER_SPLIT
+    split_end = tl.minimum(
+        split_start + PAGE_SIZE * BLOCKS_PER_SPLIT, cur_batch_seq_len
+    )
+
+    dot_dtype = Query.dtype.element_ty
+
+    cur_kv_head = cur_head
+    k_head_offset = cur_kv_head * stride_buf_kh
+    v_head_offset = cur_kv_head * stride_buf_vh
+
+    k_scale_value = tl.load(k_scale)
+    v_scale_value = tl.load(v_scale)
+    sm_scale *= 1.44269504 * k_scale_value
+    k_scale_dot = k_scale_value.to(dot_dtype)
+    v_scale_dot = v_scale_value.to(dot_dtype)
+
+    kv_dtype: tl.constexpr = K_Buffer.dtype.element_ty
+    # When loading from 8-bit
+    if kv_dtype == tl.float16 or kv_dtype == tl.bfloat16:
+        K_Buffer_i8 = K_Buffer
+        V_Buffer_i8 = V_Buffer
+    else:
+        K_Buffer_i8 = K_Buffer.to(tl.pointer_type(tl.uint8))
+        V_Buffer_i8 = V_Buffer.to(tl.pointer_type(tl.uint8))
+
+    if perform_dequant:  # Dequant only pass for prompt tokens
+        if window_size_left > 0:
+            seq_start = tl.maximum(0, cur_batch_seq_len - window_size_left - seq_len_q)
+            seq_start = (seq_start // PAGE_SIZE) * PAGE_SIZE
+            split_start = seq_start + cur_split * PAGE_SIZE * BLOCKS_PER_SPLIT
+            split_end = tl.minimum(
+                split_start + PAGE_SIZE * BLOCKS_PER_SPLIT, cur_batch_seq_len
+            )
+
+        num_kv_pages = (split_end - split_start + PAGE_SIZE - 1) // PAGE_SIZE
+
+        # When kv_group_num is large (>8), more than 1 warp is used for attn comp
+        # In that case, increase the block size to process more rows per warp
+        if q_block_head > 8:
+            if BLOCK_N * (q_block_head // 8) > PAGE_SIZE:
+                BLOCK_N_DEQUANT: tl.constexpr = PAGE_SIZE
+            else:
+                BLOCK_N_DEQUANT: tl.constexpr = BLOCK_N * (q_block_head // 8)
+        else:
+            BLOCK_N_DEQUANT: tl.constexpr = BLOCK_N
+
+        for kv_page in range(num_kv_pages):
+            kv_page_number_scalar = tl.load(
+                Req_to_tokens
+                + stride_req_to_tokens_b * cur_batch
+                + split_start // PAGE_SIZE
+                + kv_page
+            )
+            desc_k = tl.make_tensor_descriptor(
+                K_Buffer_i8
+                # real cache: block jump uses the true per-block stride
+                + kv_page_number_scalar * stride_buf_kblock
+                + k_head_offset,
+                shape=(PAGE_SIZE, BLOCK_DMODEL),
+                strides=(stride_buf_kbs, 1),
+                block_shape=(BLOCK_N_DEQUANT, BLOCK_DMODEL),
+            )
+            desc_k_quant = tl.make_tensor_descriptor(
+                KEY_SCRATCH
+                # scratch is contiguous: block stride == PAGE_SIZE * row stride
+                + (kv_page_number_scalar * PAGE_SIZE) * stride_buf_kbs
+                + k_head_offset,
+                shape=(PAGE_SIZE, BLOCK_DMODEL),
+                strides=(stride_buf_kbs, 1),
+                block_shape=(BLOCK_N_DEQUANT, BLOCK_DMODEL),
+            )
+            desc_v = tl.make_tensor_descriptor(
+                V_Buffer_i8
+                # real cache: block jump uses the true per-block stride
+                + kv_page_number_scalar * stride_buf_vblock
+                + v_head_offset,
+                shape=(PAGE_SIZE, BLOCK_DV),
+                strides=(stride_buf_vbs, 1),
+                block_shape=(BLOCK_N_DEQUANT, BLOCK_DV),
+            )
+            desc_v_quant = tl.make_tensor_descriptor(
+                VALUE_SCRATCH
+                # scratch is contiguous: block stride == PAGE_SIZE * row stride
+                + (kv_page_number_scalar * PAGE_SIZE) * stride_buf_vbs
+                + v_head_offset,
+                shape=(PAGE_SIZE, BLOCK_DV),
+                strides=(stride_buf_vbs, 1),
+                block_shape=(BLOCK_N_DEQUANT, BLOCK_DV),
+            )
+
+            for start_n in tl.range(0, PAGE_SIZE, BLOCK_N_DEQUANT):
+                k = desc_k.load([start_n, 0])
+                k = convert_to_dtype(k, kv_dtype, dot_dtype)
+                k *= k_scale_dot
+                desc_k_quant.store([start_n, 0], k)
+                v = desc_v.load([start_n, 0])
+                v = convert_to_dtype(v, kv_dtype, dot_dtype)
+                v *= v_scale_dot
+                desc_v_quant.store([start_n, 0], v)
+        return
+
+    if split_start >= split_end:
+        return
+
+    last_split = split_end == cur_batch_seq_len
+    # Update num_splits_real for stage 2
+    if last_split and (cur_head == 0):
+        tl.store(num_splits_real + cur_batch, cur_split + 1)
+
+    splits_per_split = PAGE_SIZE * BLOCKS_PER_SPLIT
+    numerator = cur_batch_seq_len - seq_start + splits_per_split - 1
+    num_splits_real_value = numerator // splits_per_split
+    output_base_idx = (
+        tl.load(flat_offset + cur_batch) * num_heads_kv * kv_group_num
+        + cur_head * kv_group_num * num_splits_real_value
+        + cur_split
+    )
+
+    desc_q_d = tl.make_tensor_descriptor(
+        Query + cur_q_start * stride_qbs + cur_head * kv_group_num * stride_qh,
+        shape=(kv_group_num, BLOCK_DMODEL),
+        strides=(stride_qh, 1),
+        block_shape=(q_block_head, BLOCK_DMODEL // BLOCK_DMODEL_SLICE),
+    )
+
+    q_d_0 = desc_q_d.load([0, 0 * BLOCK_DMODEL // BLOCK_DMODEL_SLICE]).to(dot_dtype)
+    if BLOCK_DMODEL_SLICE > 1:
+        q_d_1 = desc_q_d.load([0, 1 * BLOCK_DMODEL // BLOCK_DMODEL_SLICE]).to(dot_dtype)
+    if BLOCK_DMODEL_SLICE > 2:
+        q_d_2 = desc_q_d.load([0, 2 * BLOCK_DMODEL // BLOCK_DMODEL_SLICE]).to(dot_dtype)
+        q_d_3 = desc_q_d.load([0, 3 * BLOCK_DMODEL // BLOCK_DMODEL_SLICE]).to(dot_dtype)
+    if BLOCK_DMODEL_SLICE > 4:
+        q_d_4 = desc_q_d.load([0, 4 * BLOCK_DMODEL // BLOCK_DMODEL_SLICE]).to(dot_dtype)
+        q_d_5 = desc_q_d.load([0, 5 * BLOCK_DMODEL // BLOCK_DMODEL_SLICE]).to(dot_dtype)
+        q_d_6 = desc_q_d.load([0, 6 * BLOCK_DMODEL // BLOCK_DMODEL_SLICE]).to(dot_dtype)
+        q_d_7 = desc_q_d.load([0, 7 * BLOCK_DMODEL // BLOCK_DMODEL_SLICE]).to(dot_dtype)
+
+    # In case kv_group_num < q_block_head
+    mask_head = tl.arange(0, q_block_head) < kv_group_num
+
+    if USE_SINKS and (cur_split == 0):
+        # Sink is only used for the first split (segment 0)
+        e_max_d = (
+            (
+                tl.load(
+                    sink + cur_kv_head * kv_group_num + tl.arange(0, q_block_head),
+                    mask=mask_head,
+                )
+                .reshape([q_block_head, 1])
+                .to(tl.float32)
+            )
+            * 1.44269504
+        ).to(tl.float32)
+    else:
+        # e_max_d = tl.full([kv_group_num, 1], -float("inf"), dtype=tl.float32)
+        e_max_d = tl.full([q_block_head, 1], -1e6, dtype=tl.float32)  # More stable
+
+    e_sum_d = tl.full([q_block_head, 1], 1.0, dtype=tl.float32)
+
+    acc_d_0 = tl.zeros([q_block_head, BLOCK_DV], dtype=tl.float32)
+    # Load k/v scale. Only support per layer scale now
+
+    for start_n in range(split_start, split_end, BLOCK_N):
+        kv_page_number_scalar = tl.load(
+            Req_to_tokens + stride_req_to_tokens_b * cur_batch + start_n // PAGE_SIZE
+        )
+
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < split_end
+
+        if window_size_left > 0:
+            # Sliding window mask
+            mask_n = mask_n & (offs_n >= cur_batch_seq_len - window_size_left - 1)
+
+        desc_k = tl.make_tensor_descriptor(
+            K_Buffer_i8
+            + kv_page_number_scalar * stride_buf_kblock
+            + (start_n % PAGE_SIZE) * stride_buf_kbs
+            + k_head_offset,
+            shape=(BLOCK_DMODEL, PAGE_SIZE),
+            strides=(1, stride_buf_kbs),
+            block_shape=(BLOCK_DMODEL // BLOCK_DMODEL_SLICE, BLOCK_N),
+        )
+        k = desc_k.load([0, 0])
+        # There is a bug when doing e4m3->fp16/bf16 followed by dot
+        # hence going to fp32 first
+        k = convert_to_dtype(k, kv_dtype, tl.float32).to(dot_dtype)
+        qk_d = tl.dot(q_d_0, k)
+
+        if BLOCK_DMODEL_SLICE > 1:
+            k = desc_k.load([BLOCK_DMODEL // BLOCK_DMODEL_SLICE, 0])
+            k = convert_to_dtype(k, kv_dtype, tl.float32).to(dot_dtype)
+            qk_d += tl.dot(q_d_1, k)
+
+        if BLOCK_DMODEL_SLICE > 2:
+            k = desc_k.load([2 * BLOCK_DMODEL // BLOCK_DMODEL_SLICE, 0])
+            k = convert_to_dtype(k, kv_dtype, tl.float32).to(dot_dtype)
+            qk_d += tl.dot(q_d_2, k)
+
+            k = desc_k.load([3 * BLOCK_DMODEL // BLOCK_DMODEL_SLICE, 0])
+            k = convert_to_dtype(k, kv_dtype, tl.float32).to(dot_dtype)
+            qk_d += tl.dot(q_d_3, k)
+
+        if BLOCK_DMODEL_SLICE > 4:
+            k = desc_k.load([4 * BLOCK_DMODEL // BLOCK_DMODEL_SLICE, 0])
+            k = convert_to_dtype(k, kv_dtype, tl.float32).to(dot_dtype)
+            qk_d += tl.dot(q_d_4, k)
+
+            k = desc_k.load([5 * BLOCK_DMODEL // BLOCK_DMODEL_SLICE, 0])
+            k = convert_to_dtype(k, kv_dtype, tl.float32).to(dot_dtype)
+            qk_d += tl.dot(q_d_5, k)
+
+            k = desc_k.load([6 * BLOCK_DMODEL // BLOCK_DMODEL_SLICE, 0])
+            k = convert_to_dtype(k, kv_dtype, tl.float32).to(dot_dtype)
+            qk_d += tl.dot(q_d_6, k)
+
+            k = desc_k.load([7 * BLOCK_DMODEL // BLOCK_DMODEL_SLICE, 0])
+            k = convert_to_dtype(k, kv_dtype, tl.float32).to(dot_dtype)
+            qk_d += tl.dot(q_d_7, k)
+
+        qk_d = (qk_d * sm_scale).to(tl.float32)
+
+        # Causal mask
+        qk_d = tl.where(mask_n, qk_d, tl.full([], float("-inf"), tl.float32))
+        n_e_max_d = tl.maximum(tl.max(qk_d, 1, keep_dims=True), e_max_d)
+        re_scale_d = tl.math.exp2(e_max_d - n_e_max_d)
+        p_d = tl.math.exp2(qk_d - n_e_max_d)
+        e_sum_d = e_sum_d * re_scale_d + tl.sum(p_d, 1, keep_dims=True)
+        e_max_d = n_e_max_d
+        p_d = p_d.to(dot_dtype)
+
+        # 2d load for V
+        desc_v = tl.make_tensor_descriptor(
+            V_Buffer_i8
+            + kv_page_number_scalar * stride_buf_vblock
+            + (start_n % PAGE_SIZE) * stride_buf_vbs
+            + v_head_offset,
+            shape=(PAGE_SIZE, BLOCK_DV),
+            strides=(stride_buf_vbs, 1),
+            block_shape=(BLOCK_N, BLOCK_DV),
+        )
+        v = desc_v.load([0, 0])
+        # There is a bug when doing e4m3->fp16/bf16 followed by dot
+        # hence going to fp32 first
+        v = convert_to_dtype(v, kv_dtype, tl.float32) * v_scale_value
+        acc_d_0 *= re_scale_d
+        acc_d_0 += tl.dot(p_d, v.to(dot_dtype))
+    # Store result in the flat intermediate buffer
+    e_max_d = e_max_d + tl.math.log2(e_sum_d)
+    e_max_flat_d = tl.reshape(e_max_d, [q_block_head])
+
+    acc_norm_d_0 = acc_d_0 / e_sum_d
+
+    offs_h_d = output_base_idx + tl.arange(0, q_block_head) * num_splits_real_value
+    offs_mid_o_1_d = offs_h_d
+    tl.store(Flat_Att_Single + offs_mid_o_1_d, e_max_flat_d, mask=mask_head)
+
+    if last_split and (cur_split == 0):
+        # When there is only one split for this q position,
+        # directly write to output
+        output_base_idx = (
+            cur_q_start * num_heads_kv * kv_group_num + cur_head * kv_group_num
+        )
+        desc_o = tl.make_tensor_descriptor(
+            Output + output_base_idx * Lv,
+            shape=(kv_group_num, BLOCK_DV),
+            strides=(Lv, 1),
+            block_shape=(q_block_head, BLOCK_DV),
+        )
+        acc_norm_d = acc_norm_d_0.to(Output.dtype.element_ty)
+        desc_o.store([0, 0], acc_norm_d)
+    else:
+        # Otherwise, store to the flat intermediate buffer for stage 2
+        desc_o = tl.make_tensor_descriptor(
+            Flat_Att_Out + output_base_idx * Lv,
+            shape=(kv_group_num, BLOCK_DV),
+            strides=(num_splits_real_value * Lv, 1),
+            block_shape=(q_block_head, BLOCK_DV),
+        )
+        acc_norm_d = acc_norm_d_0.to(Flat_Att_Out.dtype.element_ty)
+        desc_o.store([0, 0], acc_norm_d)
+
+
+@triton.jit
+def _fwd_grouped_kernel_prompt(
+    # Input/Output Tensors
+    Output,
+    Query,
+    K_Buffer,
+    V_Buffer,
+    Req_to_tokens,
+    cu_seqlens_q,
+    seqused_k,
+    Flat_Att_Out,
+    Flat_Att_Single,
+    num_splits_q,
+    num_splits_real,
+    # Parameters
+    sm_scale,
+    num_decodes,
+    num_seqs,
+    prompt_counter,
+    # Strides for tensor access
+    stride_req_to_tokens_b: tl.constexpr,
+    stride_qbs: tl.constexpr,
+    stride_qh: tl.constexpr,
+    stride_buf_kbs: tl.constexpr,
+    stride_buf_kh: tl.constexpr,
+    stride_buf_vbs: tl.constexpr,
+    stride_buf_vh: tl.constexpr,
+    stride_buf_kblock: tl.constexpr,
+    stride_buf_vblock: tl.constexpr,
+    # KV scales
+    k_scale,
+    v_scale,
+    # sink
+    sink,
+    USE_SINKS: tl.constexpr,
+    # Constexprs for kernel specialization
+    window_size_left: tl.constexpr,
+    kv_group_num: tl.constexpr,
+    num_heads_kv: tl.constexpr,
+    BLOCK_DMODEL: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    BLOCK_Q: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    Lk: tl.constexpr,
+    Lv: tl.constexpr,
+    # Autotune parameters
+    BLOCK_N: tl.constexpr = 16,
+):
+    """
+    Stage 1 Kernel using static mapping. Each block processes one task.
+    It reads task info from Task_metadata and writes its partial result
+    to a unique slot in the flat Flat_Att_Out buffer.
+    """
+    num_decodes_value = tl.load(num_decodes)
+    # If num_decodes_value==16384, there are no prompt requests
+    if num_decodes_value == 16384:
+        return
+    global_id = tl.program_id(0)
+    cur_batch = (
+        global_id // (num_heads_kv * kv_group_num * num_splits_q) + num_decodes_value
+    )
+
+    while cur_batch < num_seqs:
+        local_id_0 = global_id % (num_heads_kv * kv_group_num * num_splits_q)
+        cur_head = local_id_0 // num_splits_q
+        local_id_1 = local_id_0 % num_splits_q
+        cur_seq_len_start = local_id_1 * BLOCK_Q
+        cur_split: tl.constexpr = 0  # Disable split for prompt attention
+
+        seq_len_q = tl.load(cu_seqlens_q + cur_batch + 1) - tl.load(
+            cu_seqlens_q + cur_batch
+        )
+
+        # Skip for decode tokens and out-of-bound q positions
+        if not ((seq_len_q <= 1) or (cur_seq_len_start >= seq_len_q)):
+            cur_batch_seq_len = tl.load(seqused_k + cur_batch)
+            # This is where the current q starts in the batch
+            cur_q_start = tl.load(cu_seqlens_q + cur_batch)
+
+            seq_start = 0
+            if window_size_left > 0:
+                seq_start = tl.maximum(
+                    0,
+                    cur_batch_seq_len
+                    - window_size_left
+                    - seq_len_q
+                    + cur_seq_len_start,
+                )
+                seq_start = (seq_start // PAGE_SIZE) * PAGE_SIZE
+
+            split_start = seq_start
+            # q limit
+            split_end = tl.minimum(
+                cur_batch_seq_len,
+                cur_batch_seq_len - seq_len_q + cur_seq_len_start + BLOCK_Q,
+            )
+            split_end_q = tl.minimum(seq_len_q, cur_seq_len_start + BLOCK_Q)
+
+            # split_k disabled for prompt. num_splits_real is per batch
+            if cur_head == 0 and cur_seq_len_start == 0:
+                tl.store(num_splits_real + cur_batch, 1)
+
+            dot_dtype = Query.dtype.element_ty
+
+            # perform_dequant = K_Buffer_Orig.dtype.element_ty != Query.dtype.element_ty
+
+            cur_kv_head = cur_head // kv_group_num
+            k_head_offset = cur_kv_head * stride_buf_kh
+            v_head_offset = cur_kv_head * stride_buf_vh
+
+            # For attention masking
+            offs_n_q = (
+                cur_batch_seq_len
+                - seq_len_q
+                + cur_seq_len_start
+                + tl.arange(0, BLOCK_Q)
+            )
+
+            if USE_SINKS and (cur_split == 0):
+                sink_value = tl.load(sink + cur_head)
+                # Convert sink from natural log space to log2 space
+                # for consistency with exp2/log2 computations
+                e_max_p = (
+                    (sink_value * 1.44269504).broadcast_to([BLOCK_Q]).to(tl.float32)
+                )  # multiply by 1/ln(2)
+            else:
+                e_max_p = tl.full([BLOCK_Q], -1e6, dtype=tl.float32)  # More stable
+            e_sum_p = tl.zeros([BLOCK_Q], dtype=tl.float32) + 1.0
+
+            acc_p_0 = tl.zeros([BLOCK_Q, BLOCK_DV], dtype=tl.float32)
+
+            # Block ptr
+            desc_q = tl.make_tensor_descriptor(
+                Query
+                + (cur_q_start + cur_seq_len_start) * stride_qbs
+                + cur_head * BLOCK_DMODEL,
+                shape=(split_end_q - cur_seq_len_start, BLOCK_DMODEL),
+                strides=(stride_qbs, 1),
+                block_shape=(BLOCK_Q, BLOCK_DMODEL),
+            )
+            q_p_0 = desc_q.load([0, 0]).to(dot_dtype)
+
+            num_kv_pages = (split_end - split_start + PAGE_SIZE - 1) // PAGE_SIZE
+
+            Req_to_tokens_base = (
+                Req_to_tokens
+                + stride_req_to_tokens_b * cur_batch
+                + split_start // PAGE_SIZE
+            )
+
+            K_Buffer_base = K_Buffer + k_head_offset
+            V_Buffer_base = V_Buffer + v_head_offset
+
+            # Per-block jump = true block stride of the buffer being read
+            # (contiguous scratch for fp8, interleaved real cache for bf16).
+            stride_page_kbs = stride_buf_kblock
+            stride_page_vbs = stride_buf_vblock
+
+            qk_scale = sm_scale * 1.44269504  # 1/log(2)
+
+            for kv_page in tl.range(num_kv_pages):
+                page_start = kv_page * PAGE_SIZE + split_start
+                kv_page_number_scalar = tl.load(Req_to_tokens_base + kv_page)
+
+                desc_k = tl.make_tensor_descriptor(
+                    K_Buffer_base + kv_page_number_scalar * stride_page_kbs,
+                    shape=(BLOCK_DMODEL, PAGE_SIZE),
+                    strides=(1, stride_buf_kbs),
+                    block_shape=(BLOCK_DMODEL, BLOCK_N),
+                )
+                desc_v = tl.make_tensor_descriptor(
+                    V_Buffer_base + kv_page_number_scalar * stride_page_vbs,
+                    shape=(PAGE_SIZE, BLOCK_DV),
+                    strides=(stride_buf_vbs, 1),
+                    block_shape=(BLOCK_N, BLOCK_DV),
+                )
+
+                for start_n in tl.range(0, PAGE_SIZE, BLOCK_N):
+                    k = desc_k.load([0, start_n]).to(dot_dtype)
+                    qk_p = tl.dot(q_p_0, k)
+
+                    # Causal mask
+                    offs_n = page_start + start_n + tl.arange(0, BLOCK_N)
+                    mask_qk = offs_n_q[:, None] >= offs_n[None, :]
+
+                    if window_size_left > 0:
+                        # Sliding window mask
+                        mask_qk = mask_qk & (
+                            offs_n[None, :] >= offs_n_q[:, None] - window_size_left
+                        )
+                    qk_p = (qk_p * qk_scale + tl.where(mask_qk, 0.0, -1e6)).to(
+                        tl.float32
+                    )
+
+                    n_e_max_p = tl.maximum(tl.max(qk_p, 1), e_max_p)
+                    qk_p -= n_e_max_p[:, None]
+
+                    p_p = tl.math.exp2(qk_p)
+                    re_scale_p = tl.math.exp2(e_max_p - n_e_max_p)
+                    p_p_1 = tl.sum(p_p, 1)
+
+                    acc_p_0 = acc_p_0 * re_scale_p[:, None]
+                    v = desc_v.load([start_n, 0]).to(dot_dtype)
+                    p_p = p_p.to(dot_dtype)
+                    acc_p_0 = tl.dot(p_p, v, acc_p_0)
+                    e_sum_p = e_sum_p * re_scale_p + p_p_1
+                    e_max_p = n_e_max_p
+
+            # Store result in the flat intermediate buffer
+            acc_norm_p_0 = acc_p_0 / e_sum_p[:, None]
+
+            # When there is only one split for this q position,
+            # directly write to output
+            output_base_idx = (
+                cur_q_start + cur_seq_len_start
+            ) * num_heads_kv * kv_group_num + cur_head
+            desc_o = tl.make_tensor_descriptor(
+                Output + output_base_idx * Lv,
+                shape=(split_end_q - cur_seq_len_start, BLOCK_DV),
+                strides=(kv_group_num * num_heads_kv * Lv, 1),
+                block_shape=(BLOCK_Q, BLOCK_DV),
+            )
+            acc_norm_p = acc_norm_p_0.to(Output.dtype.element_ty)
+            desc_o.store([0, 0], acc_norm_p)
+        # Increment global counter
+        global_id = tl.atomic_add(prompt_counter, 1)
+        cur_batch = (
+            global_id // (num_heads_kv * kv_group_num * num_splits_q)
+            + num_decodes_value
+        )
+
+
+@triton.jit
+def _fwd_kernel_stage2(
+    # Input/Output Tensors
+    Flat_Att_Out,
+    Flat_Att_Single,
+    o,
+    flat_offset,
+    num_splits,
+    num_splits_real,
+    cu_seqlens_q,
+    # Parameters
+    q_head_num: tl.constexpr,
+    stride_obs,
+    stride_oh,
+    # Constexprs for kernel specialization
+    HEADS_PER_BLOCK: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+    Lv: tl.constexpr,
+):
+    """
+    Stage 2 Kernel. Reads from the flat intermediate buffer.
+    It uses Stage2_metadata to find the slice of partial results
+    it needs to reduce for its assigned (batch, head) pair.
+    """
+    cur_batch = tl.program_id(0)
+    cur_head_group = tl.program_id(1)
+
+    num_splits_real_value = tl.load(num_splits_real + cur_batch)
+
+    if num_splits_real_value == 1:
+        return  # Nothing to do
+
+    flat_offset_value = tl.load(flat_offset + cur_batch)
+    offs_head = cur_head_group * HEADS_PER_BLOCK + tl.arange(0, HEADS_PER_BLOCK)
+    offs_logic = flat_offset_value * q_head_num + offs_head * num_splits_real_value
+    mask_head = offs_head < q_head_num
+
+    e_max = tl.full([HEADS_PER_BLOCK], -float("inf"), dtype=tl.float32)  # More stable
+    e_sum = tl.zeros([HEADS_PER_BLOCK], dtype=tl.float32)
+    acc = tl.zeros([HEADS_PER_BLOCK, BLOCK_DV], dtype=tl.float32)
+    output_dtype: tl.constexpr = o.dtype.element_ty
+
+    head_end = tl.minimum(q_head_num, (cur_head_group + 1) * HEADS_PER_BLOCK)
+    # Batch, head, split, Lv
+    desc_a = tl.make_tensor_descriptor(
+        Flat_Att_Out
+        + flat_offset_value * q_head_num * Lv
+        + cur_head_group * HEADS_PER_BLOCK * num_splits_real_value * Lv,
+        shape=(head_end - cur_head_group * HEADS_PER_BLOCK, num_splits_real_value * Lv),
+        strides=(num_splits_real_value * Lv, 1),
+        block_shape=(HEADS_PER_BLOCK, BLOCK_DV),
+    )
+
+    Flat_Att_Single_c = Flat_Att_Single + offs_logic
+    for i in range(0, num_splits_real_value):
+        tv = desc_a.load([0, i * Lv]).to(tl.float32)
+        tlogic = tl.load(Flat_Att_Single_c + i, mask=mask_head)
+
+        n_e_max = tl.maximum(tlogic, e_max)
+        old_scale = tl.math.exp2(e_max - n_e_max)
+        acc *= old_scale[:, None]
+        exp_logic = tl.math.exp2(tlogic - n_e_max)
+        acc += exp_logic[:, None] * tv
+        e_sum = e_sum * old_scale + exp_logic
+        e_max = n_e_max
+
+    # Map batch (seq) to token location
+    cur_q_start = tl.load(cu_seqlens_q + cur_batch)
+    # Store final result
+    desc_o = tl.make_tensor_descriptor(
+        o + cur_q_start * stride_obs + cur_head_group * HEADS_PER_BLOCK * stride_oh,
+        shape=(head_end - cur_head_group * HEADS_PER_BLOCK, BLOCK_DV),
+        strides=(stride_oh, 1),
+        block_shape=(HEADS_PER_BLOCK, BLOCK_DV),
+    )
+    desc_o.store([0, 0], (acc / e_sum[:, None]).to(output_dtype))
+
+
+try:
+    UNIT_SCALE = torch.tensor(1.0, device="xpu")
+except Exception:
+    logger.debug(
+        "XPU device not available or failed to create XPU tensor, falling back to CPU."
+    )
+    UNIT_SCALE = torch.tensor(1.0, device=torch.device("cpu"))
+
+# May need to be increased for more powerful GPUs
+PROMPT_NUM_BLOCKS = 512
+# Persistent buffers
+KEY_SCRATCH = None
+VALUE_SCRATCH = None
+FLAT_ATTN_LOGITS = None
+FLAT_ATTN_SINGLE = None
+NUM_SPLITS_REAL = None
+
+
+def initialize_triton_attention_buffers(
+    max_num_seqs: int,
+    num_heads_q: int,
+    head_dim: int,
+    kv_cache_shape: tuple,
+    kv_cache_dtype: torch.dtype,
+    query_dtype: torch.dtype,
+    device: torch.device,
+) -> None:
+    """
+    Pre-allocate attention buffers to maximum size to avoid OOM during execution.
+
+    This should be called once during model initialization, after KV cache is allocated.
+
+    Args:
+        max_num_seqs: Maximum number of sequences in a batch
+        num_heads_q: Number of query heads
+        head_dim: Dimension of each attention head
+        kv_cache_shape: Shape of the KV cache tensors
+        kv_cache_dtype: Data type of KV cache
+        query_dtype: Data type of query tensors
+        device: Device to allocate buffers on
+    """
+    global KEY_SCRATCH, VALUE_SCRATCH
+    global FLAT_ATTN_LOGITS, FLAT_ATTN_SINGLE, NUM_SPLITS_REAL
+
+    # Allocate FLAT_ATTN_LOGITS and FLAT_ATTN_SINGLE
+    max_logits_size = kv_cache_shape[0] * num_heads_q
+    BLOCK_DV = head_dim  # Assuming BLOCK_DV == head_dim
+
+    FLAT_ATTN_LOGITS = torch.empty(
+        max_logits_size, BLOCK_DV, dtype=query_dtype, device=device
+    )
+    FLAT_ATTN_SINGLE = torch.empty(max_logits_size, dtype=torch.float32, device=device)
+
+    logger.info(
+        "Allocated FLAT_ATTN_LOGITS: %s (%.2f GB)",
+        FLAT_ATTN_LOGITS.shape,
+        FLAT_ATTN_LOGITS.numel() * FLAT_ATTN_LOGITS.element_size() / 1e9,
+    )
+
+    # Allocate NUM_SPLITS_REAL
+    NUM_SPLITS_REAL = torch.empty(max_num_seqs, dtype=torch.int32, device=device)
+
+    # Allocate KEY_SCRATCH and VALUE_SCRATCH if needed for dtype conversion
+    if kv_cache_dtype != query_dtype:
+        KEY_SCRATCH = torch.zeros(kv_cache_shape, dtype=query_dtype, device=device)
+        VALUE_SCRATCH = torch.zeros(kv_cache_shape, dtype=query_dtype, device=device)
+        logger.info(
+            "Allocated KEY/VALUE_SCRATCH: %s (%.2f GB total)",
+            KEY_SCRATCH.shape,
+            2 * KEY_SCRATCH.numel() * KEY_SCRATCH.element_size() / 1e9,
+        )
+
+    logger.info(
+        "Triton attention buffers initialized: max_num_seqs=%d, num_pages=%d",
+        max_num_seqs,
+        kv_cache_shape[0],
+    )
+
+
+@torch.compile
+def calculate_flat_offset(seqused_k: torch.Tensor, page_size: int):
+    """
+    Compute a flat page-offset vector from per-sequence key usage.
+    Given the number of used keys per sequence and the page size, this function
+    computes how many pages are needed for each sequence and returns the
+    cumulative sum of these page counts. The resulting tensor can be used as
+    a "flat offset" index when laying out or accessing paged KV-cache storage
+    across multiple sequences.
+    Args:
+        seqused_k: 1D tensor where each element is the number of used keys
+            (e.g., tokens) for a sequence.
+        page_size: Number of keys stored in a single page.
+    Returns:
+        A 1D integer tensor of length ``seqused_k.numel() + 1`` containing the
+        cumulative number of pages. The first element is 0, and each subsequent
+        element gives the starting page index for the corresponding sequence in
+        a flattened paged layout.
+    """
+    k_pages = (seqused_k + page_size - 1) // page_size
+    k_pages = torch.cat(
+        [torch.zeros(1, device=seqused_k.device, dtype=k_pages.dtype), k_pages], dim=0
+    )
+    return torch.cumsum(k_pages, dim=0, dtype=k_pages.dtype)
+
+
+#@torch.compile
+def flash_attn_varlen_func_triton(
+    output: torch.Tensor,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    seqused_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    is_causal: bool,
+    block_table: torch.Tensor,
+    alibi_slopes: torch.Tensor = None,  # Not implemented
+    sink: torch.Tensor = None,
+    kv_cache_dtype: torch.dtype = torch.float16,
+    window_size_left: int = 0,
+    window_size_right: int = 0,  # Not implemented
+    k_scale: torch.Tensor = UNIT_SCALE,
+    v_scale: torch.Tensor = UNIT_SCALE,
+):
+    global KEY_SCRATCH
+    global VALUE_SCRATCH
+    global FLAT_ATTN_LOGITS
+    global FLAT_ATTN_SINGLE
+    global NUM_SPLITS_REAL
+
+    batch_size, num_heads_q, _ = query.shape
+    _, PAGE_SIZE, num_heads_kv, BLOCK_DMODEL = key_cache.shape
+    _, _, _, BLOCK_DV = value_cache.shape
+    kv_group_num = num_heads_q // num_heads_kv
+    # Split k for decode
+    BLOCKS_PER_SPLIT = 4 if key_cache.dtype.itemsize == 2 else 2  # Can be tuned
+    BLOCK_Q = max(64, kv_group_num)  # Can be tuned
+    SPLIT_SIZE = PAGE_SIZE * BLOCKS_PER_SPLIT
+    num_seqs = cu_seqlens_q.shape[0] - 1
+
+    # If num_decodes=16384, there are no prompt requests
+    # Not using a global constant as triton doesn't like that
+    num_decodes = torch.full((1,), 16384, dtype=torch.int32, device=query.device)
+
+    num_splits_q = int((max_seqlen_q + BLOCK_Q - 1) // BLOCK_Q)
+
+    assert window_size_right <= 0, "window_size_right > 0 is not supported yet"
+
+    window_size = window_size_left + 1
+    num_splits_k = int((max_seqlen_k + SPLIT_SIZE - 1) // SPLIT_SIZE)
+
+    if window_size > 0:
+        # Pad to page
+        # Need to pad both in the front and back to pages
+        # Worst case:
+        #   p0   p1   p2
+        # |----|----|----|
+        # |---w|wwwq|q---|
+        # window size is 4, q size is 2, but 3 pages are needed due to alignment
+        num_splits_k_page = (
+            window_size + max_seqlen_q + PAGE_SIZE - 1 + PAGE_SIZE - 1
+        ) // PAGE_SIZE
+        # Pad to split
+        num_splits_k = min(
+            num_splits_k, (num_splits_k_page * PAGE_SIZE + SPLIT_SIZE - 1) // SPLIT_SIZE
+        )
+
+    decode_active_tasks = num_seqs * num_heads_kv * num_splits_k
+
+    # Separate logits and e_max allows block_2d loads and stores of logits
+    # Check if buffers are pre-allocated, otherwise allocate dynamically
+    # logits_size = num_kv_pages * num_heads_q * BLOCK_DV
+    # Decode will not use more than the entire kv cache for intermediate logits
+    logits_size = key_cache.shape[0] * num_heads_q
+    if (
+        FLAT_ATTN_LOGITS is None
+        or FLAT_ATTN_LOGITS.numel() < logits_size * BLOCK_DV
+        or FLAT_ATTN_LOGITS.dtype != output.dtype
+    ):
+        if FLAT_ATTN_LOGITS is not None:
+            logger.info(
+                "FLAT_ATTN_LOGITS buffer size insufficient or dtype mismatch. "
+                "Required: %d, Available: %d. "
+                "Consider calling initialize_triton_attention_buffers()"
+                " during model init.",
+                logits_size * BLOCK_DV,
+                FLAT_ATTN_LOGITS.numel(),
+            )
+        FLAT_ATTN_LOGITS = torch.empty(
+            logits_size, BLOCK_DV, dtype=output.dtype, device=query.device
+        )
+        FLAT_ATTN_SINGLE = torch.empty(
+            logits_size,
+            dtype=torch.float32,
+            device=query.device,
+        )
+    if NUM_SPLITS_REAL is None or NUM_SPLITS_REAL.size(0) < num_seqs:
+        if NUM_SPLITS_REAL is not None:
+            logger.info(
+                "NUM_SPLITS_REAL buffer size insufficient. "
+                "Required: %d, Available: %d. "
+                "Consider calling initialize_triton_attention_buffers()"
+                " during model init.",
+                num_seqs,
+                NUM_SPLITS_REAL.size(0),
+            )
+        NUM_SPLITS_REAL = torch.empty(num_seqs, dtype=torch.int32, device=query.device)
+
+    HEADS_PER_BLOCK = 8
+    num_head_blocks = (num_heads_q + HEADS_PER_BLOCK - 1) // HEADS_PER_BLOCK
+
+    needs_dequant = key_cache.dtype != query.dtype or value_cache.dtype != query.dtype
+    if needs_dequant:
+        # The dequant pass indexes scratch by physical page number
+        # (kv_page_number_scalar * PAGE_SIZE), so KEY/VALUE_SCRATCH MUST match
+        # key_cache/value_cache shape exactly. Re-allocate on any mismatch of
+        # shape OR dtype (not just None/dtype) — otherwise a wrongly-sized
+        # pre-allocated buffer causes an out-of-bounds write and DEVICE_LOST.
+        # The pre-allocation in initialize_triton_attention_buffers() is only
+        # an optimization to avoid this realloc on the hot path.
+        if (
+            KEY_SCRATCH is None
+            or KEY_SCRATCH.dtype != query.dtype
+            or KEY_SCRATCH.shape != key_cache.shape
+        ):
+            if KEY_SCRATCH is not None:
+                logger.info(
+                    "KEY_SCRATCH buffer mismatch (have shape=%s dtype=%s, "
+                    "need shape=%s dtype=%s); reallocating. Consider passing the "
+                    "correct kv_cache_shape to initialize_triton_attention_buffers().",
+                    tuple(KEY_SCRATCH.shape),
+                    KEY_SCRATCH.dtype,
+                    tuple(key_cache.shape),
+                    query.dtype,
+                )
+            KEY_SCRATCH = torch.zeros(
+                key_cache.shape, dtype=query.dtype, device=query.device
+            )
+        if (
+            VALUE_SCRATCH is None
+            or VALUE_SCRATCH.dtype != query.dtype
+            or VALUE_SCRATCH.shape != value_cache.shape
+        ):
+            VALUE_SCRATCH = torch.zeros(
+                value_cache.shape, dtype=query.dtype, device=query.device
+            )
+
+    # Decode
+    # Not using num_decodes to launch kernel in case there are prompt requests
+    # with 1 token.
+    # E.g.: cu_seqlens_q = [0,1,3,4], num_decodes=1, but the 2nd prompt request
+    # will be processed as decode since it only has 1 token
+    if key_cache.dtype != query.dtype or value_cache.dtype != query.dtype:
+        key_scratch = KEY_SCRATCH
+        value_scratch = VALUE_SCRATCH
+    else:
+        key_scratch = key_cache
+        value_scratch = value_cache
+
+    flat_offset = calculate_flat_offset(seqused_k, PAGE_SIZE)
+    prompt_counter = torch.full(
+        (1,), PROMPT_NUM_BLOCKS, dtype=torch.int32, device=query.device
+    )
+
+    num_warps_d = max(1, triton.next_power_of_2(kv_group_num) // 8)
+    _fwd_grouped_kernel_decode[(decode_active_tasks,)](
+        output,
+        query,
+        key_cache,
+        value_cache,
+        key_scratch,
+        value_scratch,
+        block_table,
+        cu_seqlens_q,
+        seqused_k,
+        flat_offset,
+        FLAT_ATTN_LOGITS,
+        FLAT_ATTN_SINGLE,
+        num_splits_k,
+        NUM_SPLITS_REAL,
+        softmax_scale,
+        num_decodes,
+        decode_active_tasks,
+        block_table.stride(0),
+        query.stride(0),
+        query.stride(1),
+        key_cache.stride(-3),
+        key_cache.stride(-2),
+        value_cache.stride(-3),
+        value_cache.stride(-2),
+        key_cache.stride(0),
+        value_cache.stride(0),
+        k_scale,
+        v_scale,
+        sink=sink,
+        USE_SINKS=(sink is not None),
+        window_size_left=window_size_left,
+        kv_group_num=kv_group_num,
+        q_block_head=triton.next_power_of_2(kv_group_num),
+        num_heads_kv=num_heads_kv,
+        BLOCK_DMODEL=BLOCK_DMODEL,
+        BLOCK_DV=BLOCK_DV,
+        BLOCK_Q=1,
+        BLOCKS_PER_SPLIT=BLOCKS_PER_SPLIT,
+        PAGE_SIZE=PAGE_SIZE,
+        Lk=BLOCK_DMODEL,
+        Lv=BLOCK_DV,
+        # Prior autotune parameters
+        BLOCK_N=16,
+        BLOCK_DMODEL_SLICE=BLOCK_DMODEL // 16,  # Issue handling using autotune
+        num_warps=num_warps_d,
+        num_stages=1,
+        # NOTE: grf_mode="256" (large-GRF launch) overruns the work-group
+        # resource budget on the ww25 torch-2.12 level-zero submit path
+        # (UR_RESULT_ERROR_OUT_OF_RESOURCES at launch). Default GRF works.
+    )
+
+    if key_cache.dtype != query.dtype or value_cache.dtype != query.dtype:
+        key_cache_p = KEY_SCRATCH
+        value_cache_p = VALUE_SCRATCH
+    else:
+        key_cache_p = key_cache
+        value_cache_p = value_cache
+
+    # Prompt
+    if max_seqlen_q > 1:
+        _fwd_grouped_kernel_prompt[(PROMPT_NUM_BLOCKS,)](
+            output,
+            query,
+            key_cache_p,
+            value_cache_p,
+            block_table,
+            cu_seqlens_q,
+            seqused_k,
+            FLAT_ATTN_LOGITS,
+            FLAT_ATTN_SINGLE,
+            num_splits_q,
+            NUM_SPLITS_REAL,
+            softmax_scale,
+            num_decodes,
+            num_seqs,
+            prompt_counter,
+            block_table.stride(0),
+            query.stride(0),
+            query.stride(1),
+            key_cache.stride(-3),
+            key_cache.stride(-2),
+            value_cache.stride(-3),
+            value_cache.stride(-2),
+            # Block stride of the buffer this kernel actually reads: contiguous
+            # dequant scratch for fp8, interleaved real cache for bf16.
+            key_cache_p.stride(0),
+            value_cache_p.stride(0),
+            k_scale,
+            v_scale,
+            sink=sink,
+            USE_SINKS=(sink is not None),
+            window_size_left=window_size_left,
+            kv_group_num=kv_group_num,
+            num_heads_kv=num_heads_kv,
+            BLOCK_DMODEL=BLOCK_DMODEL,
+            BLOCK_DV=BLOCK_DV,
+            BLOCK_Q=BLOCK_Q,
+            PAGE_SIZE=PAGE_SIZE,
+            Lk=BLOCK_DMODEL,
+            Lv=BLOCK_DV,
+            # Prior autotune parameters
+            BLOCK_N=32,
+            num_warps=BLOCK_Q // 8,
+            num_stages=2,
+            # NOTE: grf_mode="256" removed — see decode-kernel note above.
+        )
+    # Reduction
+    _fwd_kernel_stage2[(num_seqs, num_head_blocks)](
+        FLAT_ATTN_LOGITS,
+        FLAT_ATTN_SINGLE,
+        output,
+        flat_offset,
+        num_splits_k,
+        NUM_SPLITS_REAL,
+        cu_seqlens_q,
+        num_heads_q,
+        output.stride(0),
+        output.stride(1),
+        HEADS_PER_BLOCK=HEADS_PER_BLOCK,
+        BLOCK_DV=BLOCK_DV,
+        Lv=BLOCK_DV,
+        # Prior autotune parameters
+        num_warps=4,
+        num_stages=1,
+    )
+
+
+
 
 if TYPE_CHECKING:
 
@@ -809,6 +1995,36 @@ class xpu_ops:
         else:
             assert len(window_size) == 2
             real_window_size = (window_size[0], window_size[1])  # noqa: F841
+
+        # In encode attention, k and v maybe not contiguous and current
+        # kernel can't handle it
+        if block_table is None:
+            k = k.contiguous()
+            v = v.contiguous()
+
+        if USE_TRITON_XPU_ATTN and block_table is not None:
+            if (q.dtype != torch.float16) and (q.dtype != torch.bfloat16):
+                q = q.to(out.dtype)
+            assert alibi_slopes is None, "Alibi not supported in triton xpu attn"
+            return flash_attn_varlen_func_triton(
+                out,
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                seqused_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                softmax_scale if softmax_scale is not None else q.shape[-1] ** (-0.5),
+                causal,
+                block_table,
+                alibi_slopes,
+                sink=s_aux,
+                window_size_left=real_window_size[0],
+                window_size_right=real_window_size[1],
+                k_scale=k_descale,
+                v_scale=v_descale,
+            )
 
         return flash_attn_varlen_func(
             out=out,

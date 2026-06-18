@@ -7355,6 +7355,42 @@ class GPUModelRunner(
                 kv_transfer_group.register_kv_caches(kv_caches)
             kv_transfer_group.set_host_xfer_buffer_ops(copy_kv_blocks)
 
+        if not is_profiling and current_platform.is_xpu():
+            import os
+
+            if os.environ.get("VLLM_USE_TRITON_XPU_ATTN", "0") == "1":
+                from vllm._xpu_ops import initialize_triton_attention_buffers
+
+                # The stored kv-cache tensor carries a K/V-split dimension of
+                # size 2 (layout is (num_blocks, 2, block_size, num_kv_heads,
+                # head_dim) on this backend). The triton kernel operates on a
+                # single per-cache view of shape
+                # (num_blocks, block_size, num_kv_heads, head_dim), so drop the
+                # size-2 K/V dim wherever it sits rather than assuming a fixed
+                # position. (The kernel also self-heals via a shape-checked
+                # scratch realloc, but getting this right avoids a hot-path
+                # reallocation.)
+                first_kv = next(iter(kv_caches.values()))
+                full_shape = tuple(first_kv.shape)
+                kv_dim = next(
+                    (i for i, s in enumerate(full_shape) if s == 2),
+                    0,
+                )
+                kv_cache_shape = full_shape[:kv_dim] + full_shape[kv_dim + 1 :]
+                kv_cache_dtype = first_kv.dtype
+                query_dtype = torch.bfloat16  # matches model dtype
+                initialize_triton_attention_buffers(
+                    max_num_seqs=self.scheduler_config.max_num_seqs,
+                    num_heads_q=self.model_config.get_num_attention_heads(
+                        self.parallel_config
+                    ),
+                    head_dim=self.model_config.get_head_size(),
+                    kv_cache_shape=kv_cache_shape,
+                    kv_cache_dtype=kv_cache_dtype,
+                    query_dtype=query_dtype,
+                    device=self.device,
+                )
+
     def _get_attention_kv_cache_gid(self) -> int:
         """Find the KV cache group index for attention layers.
 
