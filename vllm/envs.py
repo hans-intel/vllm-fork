@@ -273,6 +273,21 @@ if TYPE_CHECKING:
     VLLM_NIXL_EP_MAX_NUM_RANKS: int = 32
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
+    # XPU vocab-parallel Gumbel-max distributed sampling fast path (temp=1,
+    # top_p=1, top_k=-1 only). Avoids the full-logits all-gather. OFF by default:
+    # it is an opt-in feature, the baseline must stay the stock sampler.
+    VLLM_XPU_DIST_SAMPLE: bool = False
+    # When dist sampling is on, use the fused Triton gumbel+argmax kernel (no [B,V]
+    # noise materialization). ON by default: it is a pure perf win and does NOT
+    # affect accuracy (validated == stock with the MAX all-reduce). Set to 0 to use
+    # the torch.rand_like prototype path instead.
+    VLLM_XPU_DIST_SAMPLE_FUSED: bool = True
+    # When the fused path is on, reduce the per-rank packed int64 winners with an
+    # int64 [B,1] all-gather + host max instead of dist.all_reduce(op=MAX). OFF by
+    # default: this collective is the change that REGRESSED accuracy (XPU int64
+    # all-gather mis-pairs data across ranks -> livecodebench collapse). Kept behind
+    # a flag for debugging until the all-gather path is fixed.
+    VLLM_XPU_DIST_SAMPLE_ALLGATHER: bool = False
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
@@ -1877,6 +1892,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_XPU_USE_SAMPLER_KERNEL": lambda: bool(
         int(os.getenv("VLLM_XPU_USE_SAMPLER_KERNEL", "1"))
     ),
+    # XPU vocab-parallel Gumbel-max distributed sampling fast path (opt-in, off).
+    "VLLM_XPU_DIST_SAMPLE": lambda: os.environ.get("VLLM_XPU_DIST_SAMPLE", "0")
+    == "1",
+    # Fused Triton gumbel+argmax kernel for the dist path (on by default; perf
+    # only, no accuracy impact). Set 0 to fall back to the torch.rand_like path.
+    "VLLM_XPU_DIST_SAMPLE_FUSED": lambda: os.environ.get(
+        "VLLM_XPU_DIST_SAMPLE_FUSED", "1"
+    )
+    == "1",
+    # Reduce fused winners via int64 all-gather+max instead of all_reduce(MAX)
+    # (off by default: this collective currently regresses accuracy on XPU).
+    "VLLM_XPU_DIST_SAMPLE_ALLGATHER": lambda: os.environ.get(
+        "VLLM_XPU_DIST_SAMPLE_ALLGATHER", "0"
+    )
+    == "1",
     # Enable simple KV offload.
     "VLLM_USE_SIMPLE_KV_OFFLOAD": lambda: bool(
         int(os.getenv("VLLM_USE_SIMPLE_KV_OFFLOAD", "0"))

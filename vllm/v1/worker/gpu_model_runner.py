@@ -3594,6 +3594,16 @@ class GPUModelRunner(
         )
         return sampler_output
 
+    # __DIST_SAMPLE__
+    def _dist_sample_eligible(self, spec_decode_metadata) -> bool:
+        """True iff the whole batch can use vocab-parallel Gumbel-max sampling."""
+        import vllm.envs as envs
+        if not envs.VLLM_XPU_DIST_SAMPLE:
+            return False
+        if spec_decode_metadata is not None:
+            return False
+        return True
+
     def _bookkeeping_sync(
         self,
         scheduler_output: "SchedulerOutput",
@@ -7361,15 +7371,6 @@ class GPUModelRunner(
             if os.environ.get("VLLM_USE_TRITON_XPU_ATTN", "0") == "1":
                 from vllm._xpu_ops import initialize_triton_attention_buffers
 
-                # The stored kv-cache tensor carries a K/V-split dimension of
-                # size 2 (layout is (num_blocks, 2, block_size, num_kv_heads,
-                # head_dim) on this backend). The triton kernel operates on a
-                # single per-cache view of shape
-                # (num_blocks, block_size, num_kv_heads, head_dim), so drop the
-                # size-2 K/V dim wherever it sits rather than assuming a fixed
-                # position. (The kernel also self-heals via a shape-checked
-                # scratch realloc, but getting this right avoids a hot-path
-                # reallocation.)
                 first_kv = next(iter(kv_caches.values()))
                 full_shape = tuple(first_kv.shape)
                 kv_dim = next(
