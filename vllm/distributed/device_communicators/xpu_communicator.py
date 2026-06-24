@@ -91,16 +91,41 @@ class XpuCommunicator(DeviceCommunicatorBase):
         else:
             assert input_tensor.shape[0] % world_size == 0
             chunk_size = input_tensor.shape[0] // world_size
-        output_shape = (chunk_size,) + input_tensor.shape[1:]
-
-        output = torch.empty(
-            output_shape, dtype=input_tensor.dtype, device=input_tensor.device
-        )
         if sizes is not None and sizes.count(sizes[0]) != len(sizes):
-            # if inputs shape in different ranks is not the same using reduce_scatter
-            input_splits = list(input_tensor.split(sizes, dim=0))
-            dist.reduce_scatter(output, input_splits, group=self.device_group)
+            # For uneven tensors: XCCL reduce_scatter(list of unequal splits) 
+            # does NOT reduce across ranks on XPU (each rank keeps its own slice, 
+            # no summation). Pad every rank's segment up to max(sizes), build a uniform
+            # [max_size*world, ...] input, and use reduce_scatter_tensor (works on XPU),
+            # then slice this rank's real rows. 
+            max_size = max(sizes)
+            splits = list(input_tensor.split(sizes, dim=0))
+            padded_segs = []
+            for r in range(world_size):
+                seg = splits[r]
+                if seg.shape[0] < max_size:
+                    pad = torch.zeros(
+                        (max_size - seg.shape[0],) + tuple(seg.shape[1:]),
+                        dtype=seg.dtype,
+                        device=seg.device,
+                    )
+                    seg = torch.cat([seg, pad], dim=0)
+                padded_segs.append(seg)
+            big_input = torch.cat(padded_segs, dim=0).contiguous()
+            padded_output = torch.empty(
+                (max_size,) + tuple(input_tensor.shape[1:]),
+                dtype=input_tensor.dtype,
+                device=input_tensor.device,
+            )
+            dist.reduce_scatter_tensor(
+                padded_output, big_input, group=self.device_group
+            )
+            output = padded_output[: sizes[self.rank_in_group]]
         else:
+            # For equal-size tensors
+            output_shape = (chunk_size,) + input_tensor.shape[1:]
+            output = torch.empty(
+                output_shape, dtype=input_tensor.dtype, device=input_tensor.device
+            )
             dist.reduce_scatter_tensor(output, input_tensor, group=self.device_group)
         # Reshape before returning
         return output.movedim(0, dim).contiguous()
@@ -121,34 +146,52 @@ class XpuCommunicator(DeviceCommunicatorBase):
             sizes = None
 
         def _all_gather_single(input_: torch.Tensor, sizes: list[int] | None = None):
+            # Use all_gather_into_tensor (a single fused XCCL ring collective)
+            # rather than dist.all_gather(list, ...) which is both slow 
+            # (N point-to-point exchanges + a host-side torch.cat) and
+            # buggy (the list form leaves the output partly uninitialized ->
+            # NaN/garbage).
             input_size = input_.size()
             if sizes is not None:
                 assert len(sizes) == world_size
                 assert input_.shape[dim] == sizes[self.rank_in_group], (
                     f"{input_.shape[dim]} != {sizes[self.rank_in_group]}"
                 )
-                output_size = (sum(sizes),) + input_size[1:]
-            else:
-                output_size = (input_size[0] * world_size,) + input_size[1:]
-            # Allocate output tensor.
-            output_tensor = torch.empty(
-                output_size, dtype=input_.dtype, device=input_.device
-            )
-
-            if sizes is not None:
-                all_gather_list = []
-                for size in sizes:
-                    all_gather_list.append(
-                        torch.empty(
-                            (size,) + input_.shape[1:],
-                            dtype=input_.dtype,
-                            device=input_.device,
-                        )
+                # For uneven tensors: pad each rank's input up to max sizes
+                max_size = max(sizes)
+                my_size = input_.shape[0]
+                if my_size < max_size:
+                    pad = torch.zeros(
+                        (max_size - my_size,) + tuple(input_.shape[1:]),
+                        dtype=input_.dtype,
+                        device=input_.device,
                     )
-                dist.all_gather(all_gather_list, input_, group=self.device_group)
-                output_tensor = torch.cat(all_gather_list, dim=0)
+                    padded_input = torch.cat([input_, pad], dim=0)
+                else:
+                    padded_input = input_
+                padded_input = padded_input.contiguous()
+                gathered = torch.empty(
+                    (max_size * world_size,) + tuple(input_.shape[1:]),
+                    dtype=input_.dtype,
+                    device=input_.device,
+                )
+                dist.all_gather_into_tensor(
+                    gathered, padded_input, group=self.device_group
+                )
+                parts = [
+                    gathered[r * max_size : r * max_size + sizes[r]]
+                    for r in range(world_size)
+                ]
+                output_tensor = torch.cat(parts, dim=0)
             else:
-                dist.all_gather([output_tensor], input_, group=self.device_group)
+                # For equal-size tensors
+                output_size = (input_size[0] * world_size,) + input_size[1:]
+                output_tensor = torch.empty(
+                    output_size, dtype=input_.dtype, device=input_.device
+                )
+                dist.all_gather_into_tensor(
+                    output_tensor, input_.contiguous(), group=self.device_group
+                )
             return output_tensor
 
         if isinstance(input_, torch.Tensor):
