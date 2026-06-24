@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -17,6 +18,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
 import numpy as np
 import torch
 import torch.distributed
+from torch.profiler import ProfilerActivity, profile
 import torch.nn as nn
 from tqdm import tqdm
 
@@ -423,6 +425,8 @@ class GPUModelRunner(
         vllm_config: VllmConfig,
         device: torch.device,
     ):
+        self.step = 0
+        self.tp_rank = get_tp_group().rank_in_group
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
@@ -4128,6 +4132,27 @@ class GPUModelRunner(
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+
+        _step_log = (
+            os.environ.get("VLLM_STEP_LOG", "0")
+            not in ("", "0", "false", "False")
+        )
+        _count_tokens = _step_log or (
+            os.environ.get("PROFILE", "0") not in ("", "0", "false", "False")
+        )
+        num_prefill_tokens = 0
+        num_decode_tokens = 0
+        if _count_tokens:
+            for req_id, n_tok in scheduler_output.num_scheduled_tokens.items():
+                if req_id not in self.requests:
+                    num_prefill_tokens += n_tok
+                else:
+                    req_state = self.requests[req_id]
+                    if req_state.num_computed_tokens < req_state.num_prompt_tokens:
+                        num_prefill_tokens += n_tok
+                    else:
+                        num_decode_tokens += n_tok
+
         with (
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
@@ -4349,31 +4374,90 @@ class GPUModelRunner(
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
-        with (
-            set_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=num_tokens_padded,
-                num_tokens_across_dp=num_tokens_across_dp,
-                cudagraph_runtime_mode=cudagraph_mode,
-                batch_descriptor=batch_desc,
-                ubatch_slices=ubatch_slices_padded,
-                slot_mapping=slot_mappings,
-                skip_compiled=has_encoder_input,
-            ),
-            record_function_or_nullcontext("gpu_model_runner: forward"),
-            self.maybe_get_kv_connector_output(
-                scheduler_output,
-                defer_finalize=defer_kv_connector_finalize,
-            ) as kv_connector_output,
-        ):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
+
+        _do_profile = os.environ.get("PROFILE", "OFF").upper() in (
+            "1", "Y", "ON", "YES", "TRUE",
+        )
+        _profile_interval = int(os.environ.get("PROFILE_INTERVAL", 50))
+        _profile_decode_only = bool(os.environ.get("PROFILE_DECODE_ONLY"))
+        _is_checkpoint = _do_profile and (self.step % _profile_interval == 0)
+        if _profile_decode_only:
+            _is_checkpoint = (
+                _do_profile
+                and num_prefill_tokens == 0
+                and num_decode_tokens > 0
+                and self.step % _profile_interval == 0
             )
+
+        def _run_forward():
+            with (
+                set_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=num_tokens_padded,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    cudagraph_runtime_mode=cudagraph_mode,
+                    batch_descriptor=batch_desc,
+                    ubatch_slices=ubatch_slices_padded,
+                    slot_mapping=slot_mappings,
+                    skip_compiled=has_encoder_input,
+                ),
+                record_function_or_nullcontext("gpu_model_runner: forward"),
+                self.maybe_get_kv_connector_output(
+                    scheduler_output,
+                    defer_finalize=defer_kv_connector_finalize,
+                ) as kv_connector_output,
+            ):
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
+            return model_output, kv_connector_output
+
+        if _step_log:
+            torch.xpu.synchronize()
+            _step_start = time.time()
+
+        if _is_checkpoint:
+            with profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.XPU],
+                record_shapes=True,
+            ) as _prof:
+                model_output, kv_connector_output = _run_forward()
+            _tr = (
+                f"vllm_trace_rank{self.parallel_config.data_parallel_rank}"
+                f"_step{self.step}_n{num_scheduled_tokens}"
+                f"_p{num_prefill_tokens}_d{num_decode_tokens}.json.gz"
+            )
+            _prof.export_chrome_trace(_tr)
+            logger.info("Exported profiler trace: %s", _tr)
+            if os.environ.get("PROFILE_TABLE"):
+                try:
+                    _tbl = _prof.key_averages().table(
+                        sort_by="self_xpu_time_total", row_limit=30
+                    )
+                    logger.info(
+                        "[PROFILE_TABLE step#%d d=%d]\n%s",
+                        self.step, num_decode_tokens, _tbl,
+                    )
+                except Exception as _e:
+                    logger.warning("PROFILE_TABLE failed: %s", _e)
+        else:
+            model_output, kv_connector_output = _run_forward()
+
+        if _step_log:
+            torch.xpu.synchronize()
+            _step_end = time.time()
+            if self.tp_rank == 0:
+                logger.info(
+                    f"[{time.time():.3f}] step#{self.step} "
+                    f"{(_step_end - _step_start) * 1000:.3f}ms prefill/decode: "
+                    f"{num_prefill_tokens}/{num_decode_tokens} ({num_scheduled_tokens})"
+                )
+        self.step += 1
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:

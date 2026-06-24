@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -1069,6 +1070,15 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+
+        if os.environ.get("VLLM_STEP_LOG"):
+            num_free_blocks = self.kv_cache_manager.block_pool.get_num_free_blocks()
+            num_available_tokens = num_free_blocks * self.cache_config.block_size
+            logger.info(
+                f"[{time.time():.3f}]Available KV cache blocks / tokens: "
+                f"{num_free_blocks} {num_available_tokens}"
+            )
+
         return scheduler_output
 
     def _build_kv_connector_meta(
