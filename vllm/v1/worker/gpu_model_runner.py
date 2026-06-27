@@ -3602,7 +3602,51 @@ class GPUModelRunner(
             return False
         if spec_decode_metadata is not None:
             return False
+        sm = self.input_batch.sampling_metadata
+        # Must be all-random (temp>=eps), temp==1, no top_p/top_k truncation.
+        if sm.all_greedy or not sm.all_random:
+            return False
+        if sm.temperature is None or sm.top_p is not None or sm.top_k is not None:
+            return False
+        # temp must be exactly 1 across the batch.
+        if not bool(torch.all(sm.temperature == 1.0).item()):
+            return False
+        # No logprobs (would need full-vocab logsumexp).
+        if sm.max_num_logprobs is not None or sm.logprob_token_ids:
+            return False
+        # No penalties / bad words / allowed-token mask.
+        if not sm.no_penalties or sm.bad_words_token_ids or \
+                sm.allowed_token_ids_mask is not None:
+            return False
+        # No ACTIVE non-argmax-invariant logitsprocs (e.g. MinTokens before min
+        # reached, logit_bias, thinking-budget). argmax-invariant ones (min_p) are
+        # fine to skip since temp=1/top_p=1/top_k=-1 makes them inert here, but be
+        # safe and require none active.
+        lp = sm.logitsprocs
+        for proc in lp.non_argmax_invariant:
+            # MinTokens active?
+            if getattr(proc, "min_toks", None):
+                return False
+            if getattr(proc, "biases", None):
+                return False
+            if getattr(proc, "_state", None):
+                return False
         return True
+
+    def _dist_sample(self, sample_hidden_states) -> "SamplerOutput":
+        # __DIST_SAMPLE__
+        """Vocab-parallel Gumbel-max fast path. Returns SamplerOutput w/ no logprobs."""
+        # Per-step seed shared across TP ranks (lockstep execution => identical on
+        # every rank), advanced each step so the Gumbel field varies over time.
+        step_seed = getattr(self, "_dist_step_seed", 0)
+        if step_seed == 0:
+            logger.info("[DIST_SAMPLE] fused gumbel+int64-maxreduce fast path ENGAGED")
+        self._dist_step_seed = step_seed + 1
+        tokens = self.model.logits_processor.gumbel_argmax_tokens(
+            self.model.lm_head, sample_hidden_states, step_seed
+        )
+        sampled = tokens.to(torch.int32).unsqueeze(-1)
+        return SamplerOutput(sampled_token_ids=sampled, logprobs_tensors=None)
 
     def _bookkeeping_sync(
         self,
@@ -4358,7 +4402,13 @@ class GPUModelRunner(
                     )
 
                 sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states)
+                # __DIST_SAMPLE___skipgather
+                if self._dist_sample_eligible(spec_decode_metadata):
+                    self._dist_sample_chosen = True
+                    logits = None  # fast path computes local logits in sampler
+                else:
+                    self._dist_sample_chosen = False
+                    logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -4462,7 +4512,14 @@ class GPUModelRunner(
             )
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
+            # __DIST_SAMPLE___fastpath
+            # execute_model is the single eligibility decision point; it sets
+            # self._dist_sample_chosen exactly when the fast path was taken.
+            if getattr(self, "_dist_sample_chosen", False):
+                self._dist_sample_chosen = False
+                sampler_output = self._dist_sample(sample_hidden_states)
+            else:
+                sampler_output = self._sample(logits, spec_decode_metadata)
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
