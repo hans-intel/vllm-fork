@@ -1453,19 +1453,24 @@ class VllmConfig:
             )
 
         if self.parallel_config.use_ubatching:
-            a2a_backend = self.parallel_config.all2all_backend
-            assert a2a_backend in [
-                "deepep_low_latency",
-                "deepep_high_throughput",
-                "nixl_ep",
-            ], (
-                "Microbatching currently only supports the deepep_low_latency, "
-                "deepep_high_throughput, and nixl_ep all2all backends. "
-                f"{a2a_backend} is not supported. To fix use "
-                "--all2all-backend=deepep_low_latency, "
-                "--all2all-backend=deepep_high_throughput, or "
-                "--all2all-backend=nixl_ep and install the matching kernels."
-            )
+            # The all2all-backend requirement only applies to expert-parallel
+            # microbatching, where DBO overlaps the EP all2all dispatch. In
+            # pure-TP DBO (EP disabled) the overlapped collective is the TP
+            # all-reduce, so no special all2all backend is needed.
+            if self.parallel_config.enable_expert_parallel:
+                a2a_backend = self.parallel_config.all2all_backend
+                assert a2a_backend in [
+                    "deepep_low_latency",
+                    "deepep_high_throughput",
+                    "nixl_ep",
+                ], (
+                    "Microbatching currently only supports the deepep_low_latency, "
+                    "deepep_high_throughput, and nixl_ep all2all backends. "
+                    f"{a2a_backend} is not supported. To fix use "
+                    "--all2all-backend=deepep_low_latency, "
+                    "--all2all-backend=deepep_high_throughput, or "
+                    "--all2all-backend=nixl_ep and install the matching kernels."
+                )
 
             if not self.model_config.disable_cascade_attn:
                 self.model_config.disable_cascade_attn = True

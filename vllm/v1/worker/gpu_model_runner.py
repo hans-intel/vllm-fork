@@ -3879,7 +3879,21 @@ class GPUModelRunner(
         # Extra coordination when running data-parallel since we need to coordinate
         # across ranks
         should_ubatch, num_tokens_across_dp = False, None
-        if self.vllm_config.parallel_config.data_parallel_size > 1:
+        if (
+            self.vllm_config.parallel_config.data_parallel_size == 1
+            and self.parallel_config.use_ubatching
+            and allow_microbatching
+        ):
+            # Pure-TP microbatching (DBO): every TP rank runs the identical
+            # scheduler output, so each rank reaches the same threshold
+            # decision independently -- no cross-rank coordination needed.
+            # num_tokens_across_dp stays None (no DP padding to agree on).
+            should_ubatch = check_ubatch_thresholds(
+                self.parallel_config,
+                num_tokens,
+                uniform_decode=uniform_decode,
+            )
+        elif self.vllm_config.parallel_config.data_parallel_size > 1:
             should_ubatch, num_tokens_across_dp, synced_cudagraph_mode = (
                 coordinate_batch_across_dp(
                     num_tokens_unpadded=num_tokens,

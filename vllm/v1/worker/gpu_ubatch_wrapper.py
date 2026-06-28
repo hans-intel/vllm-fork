@@ -88,9 +88,14 @@ class SMControlContextManager:
                 A function that sets the number of SMs for computation.
         """
 
-        assert current_platform.is_cuda() or current_platform.is_rocm(), (
-            "SM/CU control is supported on CUDA and ROCm platforms"
-        )
+        # SM/CU partitioning between comm and compute is only wired up on
+        # CUDA/ROCm (DeepEP all2all + DeepGEMM). On other platforms (e.g. XPU)
+        # the set_* callables are no-ops, so disable the context entirely
+        # rather than failing; ubatch overlap still works via separate streams.
+        self.disabled = not (current_platform.is_cuda() or current_platform.is_rocm())
+        if self.disabled:
+            return
+
         device = torch.accelerator.current_device_index()
         total_sms = num_compute_units(device)
 
@@ -102,10 +107,14 @@ class SMControlContextManager:
         self.set_compute_sms = set_compute_sms
 
     def __enter__(self):
+        if self.disabled:
+            return
         self.set_comm_sms(self.comm_sms)
         self.set_compute_sms(self.compute_sms)
 
     def __exit__(self, exc_type, exc_value, traceback):
+        if self.disabled:
+            return
         self.set_comm_sms(self.total_sms)
         self.set_compute_sms(self.total_sms)
 
@@ -464,21 +473,26 @@ class UBatchWrapper:
 
         dp_metadata = forward_context.dp_metadata
 
-        # We shouldn't be here unless we are running with multiple DP ranks
-        assert dp_metadata is not None
-        ubatch_dp_metadata = []
-        for ubatch_slice in ubatch_slices:
-            dp_size = self.vllm_config.parallel_config.data_parallel_size
-            ubatch_num_tokens_across_dp = torch.tensor(
-                [ubatch_slice.num_tokens] * dp_size, device="cpu", dtype=torch.int32
-            )
-            ubatch_dp_metadata.append(
-                DPMetadata.make(
-                    self.vllm_config.parallel_config,
-                    ubatch_slice.num_tokens,
-                    ubatch_num_tokens_across_dp,
+        # With DP we build per-ubatch DPMetadata; in pure-TP microbatching
+        # (DBO with data_parallel_size == 1) there is no DP dimension, so each
+        # ubatch carries dp_metadata=None just like the non-ubatched path.
+        dp_size = self.vllm_config.parallel_config.data_parallel_size
+        if dp_size == 1:
+            ubatch_dp_metadata: list[DPMetadata | None] = [None] * len(ubatch_slices)
+        else:
+            assert dp_metadata is not None
+            ubatch_dp_metadata = []
+            for ubatch_slice in ubatch_slices:
+                ubatch_num_tokens_across_dp = torch.tensor(
+                    [ubatch_slice.num_tokens] * dp_size, device="cpu", dtype=torch.int32
                 )
-            )
+                ubatch_dp_metadata.append(
+                    DPMetadata.make(
+                        self.vllm_config.parallel_config,
+                        ubatch_slice.num_tokens,
+                        ubatch_num_tokens_across_dp,
+                    )
+                )
 
         if (
             num_tokens not in self.cudagraphs
