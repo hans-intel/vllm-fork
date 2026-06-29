@@ -4492,7 +4492,18 @@ class GPUModelRunner(
                     logits = None  # fast path computes local logits in sampler
                 else:
                     self._dist_sample_chosen = False
-                    logits = self.model.compute_logits(sample_hidden_states)
+                    if os.environ.get("VLLM_STEP_LOG", "0") not in (
+                        "", "0", "false", "False"
+                    ):
+                        # gather_ms = full-logits all-gather + compute_logits, the
+                        # cost dist-sample removes. Only fires on stock steps.
+                        torch.xpu.synchronize()
+                        _gather_start = time.time()
+                        logits = self.model.compute_logits(sample_hidden_states)
+                        torch.xpu.synchronize()
+                        self._gather_ms = (time.time() - _gather_start) * 1000
+                    else:
+                        logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -4595,15 +4606,42 @@ class GPUModelRunner(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
 
+        _sample_log = (
+            os.environ.get("VLLM_STEP_LOG", "0")
+            not in ("", "0", "false", "False")
+        )
+        # Capture before _dist_sample_chosen is consumed below.
+        _is_dist = getattr(self, "_dist_sample_chosen", False)
+        if _sample_log:
+            torch.xpu.synchronize()
+            _sample_start = time.time()
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             # __DIST_SAMPLE___fastpath
             # execute_model is the single eligibility decision point; it sets
             # self._dist_sample_chosen exactly when the fast path was taken.
-            if getattr(self, "_dist_sample_chosen", False):
+            if _is_dist:
                 self._dist_sample_chosen = False
+                # Dist path: sample_ms covers local gumbel-argmax + all_reduce(MAX)
+                # (the gather replacement); logits is None so no gather_ms.
                 sampler_output = self._dist_sample(sample_hidden_states)
             else:
                 sampler_output = self._sample(logits, spec_decode_metadata)
+        if _sample_log:
+            torch.xpu.synchronize()
+            _sample_bs = (
+                logits.shape[0] if logits is not None
+                else sample_hidden_states.shape[0]
+            )
+            if self.tp_rank == 0:
+                # gather_ms only set on stock steps; -1 on dist steps (removed).
+                _gather_ms = -1.0 if _is_dist else getattr(self, "_gather_ms", -1.0)
+                # self.step was already incremented in execute_model; subtract 1
+                # so this aligns with the forward log's step number.
+                logger.info(
+                    f"[{time.time():.3f}] step#{self.step - 1} sample "
+                    f"{(time.time() - _sample_start) * 1000:.3f}ms bs={_sample_bs} "
+                    f"gather={_gather_ms:.3f}ms dist={int(_is_dist)}"
+                )
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
