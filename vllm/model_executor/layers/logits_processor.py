@@ -156,12 +156,39 @@ class LogitsProcessor(PluggableLayer):
         return top_tokens.squeeze(-1).to(torch.int64)
 
     # __DIST_SAMPLE__
+    @staticmethod
+    def _apply_min_tokens_mask(
+        logits: torch.Tensor,
+        vocab_start: int,
+        min_tokens_mask: tuple[torch.Tensor, torch.Tensor] | None,
+    ) -> None:
+        """Set stop/EOS-token logits to -inf for under-min requests, in place.
+
+        min_tokens_mask is the stock MinTokensLogitsProcessor.logits_slice:
+        (batch_row_ids, global_token_ids). Each global token id lives on exactly
+        one vocab shard; this rank masks only the ids that fall in its shard
+        [vocab_start, vocab_start + shard_width). Reproduces the stock masking
+        exactly so the vocab-parallel argmax cannot pick a censored stop token."""
+        if min_tokens_mask is None:
+            return
+        rows, global_tok_ids = min_tokens_mask
+        if rows.numel() == 0:
+            return
+        local_cols = global_tok_ids.to(torch.int64) - vocab_start
+        in_shard = (local_cols >= 0) & (local_cols < logits.shape[-1])
+        if not bool(in_shard.any()):
+            return
+        sel_rows = rows.to(torch.int64)[in_shard]
+        sel_cols = local_cols[in_shard]
+        logits[sel_rows, sel_cols] = -float("inf")
+
     def gumbel_argmax_tokens(
         self,
         lm_head: VocabParallelEmbedding,
         hidden_states: torch.Tensor,
         step_seed: int,
         embedding_bias: torch.Tensor | None = None,
+        min_tokens_mask: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Vocab-parallel Gumbel-max sample WITHOUT all-gathering full logits.
 
@@ -183,10 +210,10 @@ class LogitsProcessor(PluggableLayer):
 
         if envs.VLLM_XPU_DIST_SAMPLE_FUSED:
             return self._gumbel_argmax_tokens_fused(
-                lm_head, hidden_states, step_seed, embedding_bias
+                lm_head, hidden_states, step_seed, embedding_bias, min_tokens_mask
             )
         return self._gumbel_argmax_tokens_proto(
-            lm_head, hidden_states, step_seed, embedding_bias
+            lm_head, hidden_states, step_seed, embedding_bias, min_tokens_mask
         )
 
     def _gumbel_argmax_tokens_proto(
@@ -195,6 +222,7 @@ class LogitsProcessor(PluggableLayer):
         hidden_states: torch.Tensor,
         step_seed: int,
         embedding_bias: torch.Tensor | None = None,
+        min_tokens_mask: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """PROTOTYPE Gumbel-max (validated == stock). torch.rand_like noise on the
         local shard + [B,2] float (value, global_index) all-gather + value-argmax.
@@ -219,6 +247,11 @@ class LogitsProcessor(PluggableLayer):
         num_pad = lm_head.shard_indices.num_org_vocab_padding
         if num_pad > 0:
             logits[..., -num_pad:] = -float("inf")
+
+        # MinTokens: censor stop/EOS tokens on the owning shard before argmax.
+        self._apply_min_tokens_mask(
+            logits, lm_head.shard_indices.org_vocab_start_index, min_tokens_mask
+        )
 
         # Gumbel(0,1) = -log(-log(U)), U~Uniform(0,1), fresh entropy each call.
         u = torch.rand_like(logits)
@@ -249,6 +282,7 @@ class LogitsProcessor(PluggableLayer):
         hidden_states: torch.Tensor,
         step_seed: int,
         embedding_bias: torch.Tensor | None = None,
+        min_tokens_mask: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Fused Triton gumbel+argmax kernel + cross-rank int64 winner reduce.
 
@@ -283,6 +317,12 @@ class LogitsProcessor(PluggableLayer):
         num_pad = lm_head.shard_indices.num_org_vocab_padding
         if num_pad > 0:
             logits[..., -num_pad:] = -float("inf")
+
+        # MinTokens: censor stop/EOS tokens on the owning shard before the fused
+        # gumbel+argmax kernel reads these logits.
+        self._apply_min_tokens_mask(
+            logits, lm_head.shard_indices.org_vocab_start_index, min_tokens_mask
+        )
 
         vocab_start = lm_head.shard_indices.org_vocab_start_index
         packed = dist_gumbel_local_packed(

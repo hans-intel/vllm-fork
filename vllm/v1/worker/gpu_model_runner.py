@@ -3622,20 +3622,38 @@ class GPUModelRunner(
         if not sm.no_penalties or sm.bad_words_token_ids or \
                 sm.allowed_token_ids_mask is not None:
             return False
-        # No ACTIVE non-argmax-invariant logitsprocs (e.g. MinTokens before min
-        # reached, logit_bias, thinking-budget). argmax-invariant ones (min_p) are
-        # fine to skip since temp=1/top_p=1/top_k=-1 makes them inert here, but be
-        # safe and require none active.
+        # No ACTIVE non-argmax-invariant logitsprocs we can't reproduce locally
+        # (logit_bias, thinking-budget). argmax-invariant ones (min_p) are fine to
+        # skip since temp=1/top_p=1/top_k=-1 makes them inert here.
+        #
+        # MinTokens IS handled: it only masks stop/EOS token logits to -inf for
+        # under-min requests, and those token ids live on a single vocab shard, so
+        # _dist_sample reproduces it locally (see _min_tokens_mask_slice). This
+        # matters because under continuous batching (MLPerf offline) a freshly
+        # admitted request keeps MinTokens active almost every step, which would
+        # otherwise disable the fast path for the entire run.
         lp = sm.logitsprocs
         for proc in lp.non_argmax_invariant:
-            # MinTokens active?
             if getattr(proc, "min_toks", None):
-                return False
+                continue  # handled locally in _dist_sample
             if getattr(proc, "biases", None):
                 return False
             if getattr(proc, "_state", None):
                 return False
         return True
+
+    def _min_tokens_mask_slice(self):
+        """If a MinTokens logits processor is active, return its precomputed
+        (row_indices, global_token_ids) device tensors to mask to -inf; else None.
+
+        This is the exact slice the stock MinTokensLogitsProcessor.apply() uses, so
+        the dist path masks identically. Reading the dict's truthiness is host-side
+        and sync-free."""
+        sm = self.input_batch.sampling_metadata
+        for proc in sm.logitsprocs.non_argmax_invariant:
+            if getattr(proc, "min_toks", None):
+                return getattr(proc, "logits_slice", None)
+        return None
 
     def _dist_sample(self, sample_hidden_states) -> "SamplerOutput":
         # __DIST_SAMPLE__
@@ -3646,8 +3664,12 @@ class GPUModelRunner(
         if step_seed == 0:
             logger.info("[DIST_SAMPLE] fused gumbel+int64-maxreduce fast path ENGAGED")
         self._dist_step_seed = step_seed + 1
+        # MinTokens: reproduce the stock EOS/stop-token -inf masking locally. The
+        # slice is (batch_row_ids, global_token_ids); the owning shard masks it.
+        min_tokens_mask = self._min_tokens_mask_slice()
         tokens = self.model.logits_processor.gumbel_argmax_tokens(
-            self.model.lm_head, sample_hidden_states, step_seed
+            self.model.lm_head, sample_hidden_states, step_seed,
+            min_tokens_mask=min_tokens_mask,
         )
         sampled = tokens.to(torch.int32).unsqueeze(-1)
         return SamplerOutput(sampled_token_ids=sampled, logprobs_tensors=None)
