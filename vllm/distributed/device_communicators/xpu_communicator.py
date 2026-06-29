@@ -43,6 +43,17 @@ VLLM_XPU_FP8_ALLREDUCE = os.environ.get("VLLM_XPU_FP8_ALLREDUCE", "0") == "1"
 VLLM_XPU_FP8_ALLREDUCE_SCALE = float(
     os.environ.get("VLLM_XPU_FP8_ALLREDUCE_SCALE", "128.0")
 )
+# Minimum leading-dim (token count) for the fp8 path to engage. The fp8 path
+# trades wire bytes for a fixed overhead (two collectives instead of one, plus
+# the quant and the Triton dequant launch), so it only wins once the message is
+# big enough to be bandwidth-bound. Microbenched crossover on gpt-oss TP=8
+# (H=2880, fused-Triton path, 8-rank PCIe): fp8 loses at <=192 tokens (0.83x),
+# breaks even at 256 (1.00x), and wins from 320 up (1.14x -> 1.24x at 3072).
+# Default 256 = the measured break-even; raise it for a more conservative gate,
+# or set to a small value to engage fp8 on (nearly) every all-reduce.
+VLLM_XPU_FP8_ALLREDUCE_MIN_TOKENS = int(
+    os.environ.get("VLLM_XPU_FP8_ALLREDUCE_MIN_TOKENS", "256")
+)
 _FP8_DTYPE = torch.float8_e4m3fn
 
 try:
@@ -104,16 +115,18 @@ class XpuCommunicator(DeviceCommunicatorBase):
         # Only worthwhile for the large bf16 activation all-reduces, and only
         # when the leading dim splits evenly across ranks (reduce-scatter
         # requirement). Needs the fused Triton dequant to actually be a win.
-        # Small or non-divisible tensors fall back to bf16. The per-rank shard
-        # must also be a multiple of 4 fp8 elements so it reinterprets cleanly
-        # as int32 for the all-gather (see _fp8_all_reduce step 3).
+        # Small (decode-heavy) or non-divisible tensors fall back to bf16: the
+        # fp8 path's fixed overhead only pays off above the token-count crossover
+        # (see VLLM_XPU_FP8_ALLREDUCE_MIN_TOKENS). The per-rank shard must also be
+        # a multiple of 4 fp8 elements so it reinterprets cleanly as int32 for
+        # the all-gather (see _fp8_all_reduce step 3).
         if not (
             _HAS_TRITON
             and input_.dtype == torch.bfloat16
             and input_.is_contiguous()
             and input_.dim() >= 1
+            and input_.shape[0] >= VLLM_XPU_FP8_ALLREDUCE_MIN_TOKENS
             and input_.shape[0] % self.world_size == 0
-            and input_.numel() >= 4096
         ):
             return False
         shard_numel = input_.numel() // self.world_size
