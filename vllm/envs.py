@@ -288,6 +288,14 @@ if TYPE_CHECKING:
     # all-gather mis-pairs data across ranks -> livecodebench collapse). Kept behind
     # a flag for debugging until the all-gather path is fixed.
     VLLM_XPU_DIST_SAMPLE_ALLGATHER: bool = False
+    # When the fused path is on, reduce the per-rank winners with a 0-fill fp32 SUM
+    # all-reduce (separate value/index tensors) instead of the int64 MAX all-reduce.
+    # int64 XCCL reductions hit a slow elementwise path (~13x slower than fp32 in a
+    # standalone microbench; ~1.3ms vs target ~0.1-0.3ms in-engine). fp32 SUM with a
+    # per-rank 0-filled [B,TP,2] tensor + local argmax is mathematically identical
+    # (disjoint TP slots; idx<2**24 fp32-exact) and uses the tuned fp32 collective.
+    # ON by default once validated == stock; set 0 to fall back to int64 MAX.
+    VLLM_XPU_DIST_SAMPLE_FP32_REDUCE: bool = True
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
@@ -1905,6 +1913,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (off by default: this collective currently regresses accuracy on XPU).
     "VLLM_XPU_DIST_SAMPLE_ALLGATHER": lambda: os.environ.get(
         "VLLM_XPU_DIST_SAMPLE_ALLGATHER", "0"
+    )
+    == "1",
+    # Reduce fused winners via 0-fill fp32 SUM all-reduce instead of int64 MAX
+    # (on by default: fp32 collective is ~13x faster than the int64 path).
+    "VLLM_XPU_DIST_SAMPLE_FP32_REDUCE": lambda: os.environ.get(
+        "VLLM_XPU_DIST_SAMPLE_FP32_REDUCE", "1"
     )
     == "1",
     # Enable simple KV offload.

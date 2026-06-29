@@ -9,9 +9,12 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_gather,
 )
+from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.platforms import current_platform
+
+logger = init_logger(__name__)
 
 
 # --8<-- [start:logits_processor]
@@ -304,6 +307,16 @@ class LogitsProcessor(PluggableLayer):
 
         tp_size = get_tensor_model_parallel_world_size()
 
+        # Synced sub-timers (VLLM_STEP_LOG): split dist sample_ms into matmul /
+        # gumbel-kernel / reduce to locate the ~4ms. XPU is async so each segment
+        # needs torch.xpu.synchronize() to measure real (not enqueue) time.
+        import os
+        _brk = bool(os.environ.get("VLLM_STEP_LOG"))
+        if _brk:
+            import time as _t
+            torch.xpu.synchronize()
+            _t0 = _t.time()
+
         # Local shard logits (NO gather). float32 for stable noise add + compare.
         logits = lm_head.quant_method.apply(
             lm_head, hidden_states, bias=embedding_bias
@@ -324,10 +337,58 @@ class LogitsProcessor(PluggableLayer):
             logits, lm_head.shard_indices.org_vocab_start_index, min_tokens_mask
         )
 
+        if _brk:
+            torch.xpu.synchronize()
+            _t1 = _t.time()  # matmul + masking done
+
         vocab_start = lm_head.shard_indices.org_vocab_start_index
+        B = logits.shape[0]
+
+        # FP32-REDUCE path: separate (value, global_idx) fp32 + 0-fill SUM all-reduce.
+        # int64 XCCL reductions hit a slow elementwise path; fp32 SUM is the tuned
+        # collective (~13x faster standalone). Per-rank slots are disjoint so SUM
+        # over a 0-filled [B,TP,2] reconstructs the gathered table exactly; idx<2**24
+        # is fp32-exact. Mathematically identical winner to the int64 MAX path.
+        if tp_size > 1 and envs.VLLM_XPU_DIST_SAMPLE_FP32_REDUCE:
+            from vllm.v1.worker.gpu.sample.gumbel import dist_gumbel_local_validx
+            import torch.distributed as dist
+
+            value, global_idx = dist_gumbel_local_validx(
+                logits, int(step_seed), int(vocab_start), int(self.org_vocab_size)
+            )
+            if _brk:
+                torch.xpu.synchronize()
+                _t2 = _t.time()  # gumbel kernel done
+
+            rank = get_tp_group().rank_in_group
+            table = logits.new_zeros(B, tp_size, 2)  # fp32
+            table[:, rank, 0] = value
+            table[:, rank, 1] = global_idx
+            dist.all_reduce(
+                table, op=dist.ReduceOp.SUM, group=get_tp_group().device_group
+            )
+            best = table[:, :, 0].argmax(dim=-1, keepdim=True)
+            tokens = table[:, :, 1].gather(-1, best).squeeze(-1).to(torch.int64)
+
+            if _brk:
+                torch.xpu.synchronize()
+                _t3 = _t.time()
+                if rank == 0:
+                    logger.info(
+                        "[DIST_BRK] fp32 B=%d matmul=%.3fms kernel=%.3fms "
+                        "reduce=%.3fms total=%.3fms",
+                        B, (_t1 - _t0) * 1000, (_t2 - _t1) * 1000,
+                        (_t3 - _t2) * 1000, (_t3 - _t0) * 1000,
+                    )
+            return tokens
+
         packed = dist_gumbel_local_packed(
             logits, int(step_seed), int(vocab_start), int(self.org_vocab_size)
         )
+
+        if _brk:
+            torch.xpu.synchronize()
+            _t2 = _t.time()  # gumbel+pack kernel done
 
         if tp_size == 1:
             return packed & 0x7FFFFFFF
@@ -353,6 +414,21 @@ class LogitsProcessor(PluggableLayer):
             op=dist.ReduceOp.MAX,
             group=get_tp_group().device_group,
         )
+
+        if _brk:
+            torch.xpu.synchronize()
+            _t3 = _t.time()  # cross-rank reduce done
+            if get_tp_group().rank_in_group == 0:
+                logger.info(
+                    "[DIST_BRK] i64 B=%d matmul=%.3fms kernel=%.3fms reduce=%.3fms "
+                    "total=%.3fms",
+                    logits.shape[0],
+                    (_t1 - _t0) * 1000,
+                    (_t2 - _t1) * 1000,
+                    (_t3 - _t2) * 1000,
+                    (_t3 - _t0) * 1000,
+                )
+
         return packed & 0x7FFFFFFF
 
     def extra_repr(self) -> str:
