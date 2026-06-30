@@ -3598,6 +3598,82 @@ class GPUModelRunner(
         )
         return sampler_output
 
+    # __DIST_SAMPLE__
+    def _dist_sample_eligible(self, spec_decode_metadata) -> bool:
+        """True iff the whole batch can use vocab-parallel Gumbel-max sampling."""
+        import vllm.envs as envs
+        if not envs.VLLM_XPU_DIST_SAMPLE:
+            return False
+        if spec_decode_metadata is not None:
+            return False
+        sm = self.input_batch.sampling_metadata
+        # Must be all-random (temp>=eps), temp==1, no top_p/top_k truncation.
+        if sm.all_greedy or not sm.all_random:
+            return False
+        if sm.temperature is None or sm.top_p is not None or sm.top_k is not None:
+            return False
+        # temp must be exactly 1 across the batch.
+        if not bool(torch.all(sm.temperature == 1.0).item()):
+            return False
+        # No logprobs (would need full-vocab logsumexp).
+        if sm.max_num_logprobs is not None or sm.logprob_token_ids:
+            return False
+        # No penalties / bad words / allowed-token mask.
+        if not sm.no_penalties or sm.bad_words_token_ids or \
+                sm.allowed_token_ids_mask is not None:
+            return False
+        # No ACTIVE non-argmax-invariant logitsprocs we can't reproduce locally
+        # (logit_bias, thinking-budget). argmax-invariant ones (min_p) are fine to
+        # skip since temp=1/top_p=1/top_k=-1 makes them inert here.
+        #
+        # MinTokens IS handled: it only masks stop/EOS token logits to -inf for
+        # under-min requests, and those token ids live on a single vocab shard, so
+        # _dist_sample reproduces it locally (see _min_tokens_mask_slice). This
+        # matters because under continuous batching (MLPerf offline) a freshly
+        # admitted request keeps MinTokens active almost every step, which would
+        # otherwise disable the fast path for the entire run.
+        lp = sm.logitsprocs
+        for proc in lp.non_argmax_invariant:
+            if getattr(proc, "min_toks", None):
+                continue  # handled locally in _dist_sample
+            if getattr(proc, "biases", None):
+                return False
+            if getattr(proc, "_state", None):
+                return False
+        return True
+
+    def _min_tokens_mask_slice(self):
+        """If a MinTokens logits processor is active, return its precomputed
+        (row_indices, global_token_ids) device tensors to mask to -inf; else None.
+
+        This is the exact slice the stock MinTokensLogitsProcessor.apply() uses, so
+        the dist path masks identically. Reading the dict's truthiness is host-side
+        and sync-free."""
+        sm = self.input_batch.sampling_metadata
+        for proc in sm.logitsprocs.non_argmax_invariant:
+            if getattr(proc, "min_toks", None):
+                return getattr(proc, "logits_slice", None)
+        return None
+
+    def _dist_sample(self, sample_hidden_states) -> "SamplerOutput":
+        # __DIST_SAMPLE__
+        """Vocab-parallel Gumbel-max fast path. Returns SamplerOutput w/ no logprobs."""
+        # Per-step seed shared across TP ranks (lockstep execution => identical on
+        # every rank), advanced each step so the Gumbel field varies over time.
+        step_seed = getattr(self, "_dist_step_seed", 0)
+        if step_seed == 0:
+            logger.info("[DIST_SAMPLE] fused gumbel+int64-maxreduce fast path ENGAGED")
+        self._dist_step_seed = step_seed + 1
+        # MinTokens: reproduce the stock EOS/stop-token -inf masking locally. The
+        # slice is (batch_row_ids, global_token_ids); the owning shard masks it.
+        min_tokens_mask = self._min_tokens_mask_slice()
+        tokens = self.model.logits_processor.gumbel_argmax_tokens(
+            self.model.lm_head, sample_hidden_states, step_seed,
+            min_tokens_mask=min_tokens_mask,
+        )
+        sampled = tokens.to(torch.int32).unsqueeze(-1)
+        return SamplerOutput(sampled_token_ids=sampled, logprobs_tensors=None)
+
     def _bookkeeping_sync(
         self,
         scheduler_output: "SchedulerOutput",
@@ -4431,7 +4507,24 @@ class GPUModelRunner(
                     )
 
                 sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states)
+                # __DIST_SAMPLE___skipgather
+                if self._dist_sample_eligible(spec_decode_metadata):
+                    self._dist_sample_chosen = True
+                    logits = None  # fast path computes local logits in sampler
+                else:
+                    self._dist_sample_chosen = False
+                    if os.environ.get("VLLM_STEP_LOG", "0") not in (
+                        "", "0", "false", "False"
+                    ):
+                        # gather_ms = full-logits all-gather + compute_logits, the
+                        # cost dist-sample removes. Only fires on stock steps.
+                        torch.xpu.synchronize()
+                        _gather_start = time.time()
+                        logits = self.model.compute_logits(sample_hidden_states)
+                        torch.xpu.synchronize()
+                        self._gather_ms = (time.time() - _gather_start) * 1000
+                    else:
+                        logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -4534,8 +4627,42 @@ class GPUModelRunner(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
 
+        _sample_log = (
+            os.environ.get("VLLM_STEP_LOG", "0")
+            not in ("", "0", "false", "False")
+        )
+        # Capture before _dist_sample_chosen is consumed below.
+        _is_dist = getattr(self, "_dist_sample_chosen", False)
+        if _sample_log:
+            torch.xpu.synchronize()
+            _sample_start = time.time()
         with record_function_or_nullcontext("gpu_model_runner: sample"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
+            # __DIST_SAMPLE___fastpath
+            # execute_model is the single eligibility decision point; it sets
+            # self._dist_sample_chosen exactly when the fast path was taken.
+            if _is_dist:
+                self._dist_sample_chosen = False
+                # Dist path: sample_ms covers local gumbel-argmax + all_reduce(MAX)
+                # (the gather replacement); logits is None so no gather_ms.
+                sampler_output = self._dist_sample(sample_hidden_states)
+            else:
+                sampler_output = self._sample(logits, spec_decode_metadata)
+        if _sample_log:
+            torch.xpu.synchronize()
+            _sample_bs = (
+                logits.shape[0] if logits is not None
+                else sample_hidden_states.shape[0]
+            )
+            if self.tp_rank == 0:
+                # gather_ms only set on stock steps; -1 on dist steps (removed).
+                _gather_ms = -1.0 if _is_dist else getattr(self, "_gather_ms", -1.0)
+                # self.step was already incremented in execute_model; subtract 1
+                # so this aligns with the forward log's step number.
+                logger.info(
+                    f"[{time.time():.3f}] step#{self.step - 1} sample "
+                    f"{(time.time() - _sample_start) * 1000:.3f}ms bs={_sample_bs} "
+                    f"gather={_gather_ms:.3f}ms dist={int(_is_dist)}"
+                )
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
@@ -7444,15 +7571,6 @@ class GPUModelRunner(
             if os.environ.get("VLLM_USE_TRITON_XPU_ATTN", "0") == "1":
                 from vllm._xpu_ops import initialize_triton_attention_buffers
 
-                # The stored kv-cache tensor carries a K/V-split dimension of
-                # size 2 (layout is (num_blocks, 2, block_size, num_kv_heads,
-                # head_dim) on this backend). The triton kernel operates on a
-                # single per-cache view of shape
-                # (num_blocks, block_size, num_kv_heads, head_dim), so drop the
-                # size-2 K/V dim wherever it sits rather than assuming a fixed
-                # position. (The kernel also self-heals via a shape-checked
-                # scratch realloc, but getting this right avoids a hot-path
-                # reallocation.)
                 first_kv = next(iter(kv_caches.values()))
                 full_shape = tuple(first_kv.shape)
                 kv_dim = next(
