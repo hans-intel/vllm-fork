@@ -307,11 +307,13 @@ class LogitsProcessor(PluggableLayer):
 
         tp_size = get_tensor_model_parallel_world_size()
 
-        # Synced sub-timers (VLLM_STEP_LOG): split dist sample_ms into matmul /
-        # gumbel-kernel / reduce to locate the ~4ms. XPU is async so each segment
-        # needs torch.xpu.synchronize() to measure real (not enqueue) time.
+        # Synced sub-timers (VLLM_DIST_SAMPLE_BRK only — NOT VLLM_STEP_LOG): split
+        # dist sample_ms into matmul / gumbel-kernel / reduce. These add 3 extra
+        # torch.xpu.synchronize() that SERIALIZE the internal pipeline and inflate
+        # the outer sample_ms by ~1ms, so they must NOT be on during a perf run /
+        # fp32-vs-int64 A/B. Diagnostic-only, off by default.
         import os
-        _brk = bool(os.environ.get("VLLM_STEP_LOG"))
+        _brk = bool(os.environ.get("VLLM_DIST_SAMPLE_BRK"))
         if _brk:
             import time as _t
             torch.xpu.synchronize()
