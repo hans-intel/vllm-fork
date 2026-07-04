@@ -273,6 +273,7 @@ if TYPE_CHECKING:
     VLLM_NIXL_EP_MAX_NUM_RANKS: int = 32
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
+    VLLM_ENABLE_DIST_SAMPLE: bool = False
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
@@ -1877,6 +1878,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_XPU_USE_SAMPLER_KERNEL": lambda: bool(
         int(os.getenv("VLLM_XPU_USE_SAMPLER_KERNEL", "1"))
     ),
+    # Vocab-parallel Gumbel-max distributed sampling fast path.
+    "VLLM_ENABLE_DIST_SAMPLE": lambda: os.environ.get("VLLM_ENABLE_DIST_SAMPLE", "0")
+    == "1",
     # Enable simple KV offload.
     "VLLM_USE_SIMPLE_KV_OFFLOAD": lambda: bool(
         int(os.getenv("VLLM_USE_SIMPLE_KV_OFFLOAD", "0"))

@@ -3598,6 +3598,58 @@ class GPUModelRunner(
         )
         return sampler_output
 
+    def _dist_sample_eligible(self, spec_decode_metadata) -> bool:
+        """True iff the whole batch can use vocab-parallel Gumbel-max sampling."""
+        import vllm.envs as envs
+        if not envs.VLLM_ENABLE_DIST_SAMPLE:
+            return False
+        if spec_decode_metadata is not None:
+            return False
+        sm = self.input_batch.sampling_metadata
+        # Must be all-random (temp>=eps), temp==1, no top_p/top_k truncation.
+        # TODO: topk > 0
+        if sm.all_greedy or not sm.all_random:
+            return False
+        if sm.temperature is None or sm.top_p is not None or sm.top_k is not None:
+            return False
+        # temp must be exactly 1 across the batch. 
+        # TODO: temp <1
+        if not bool(torch.all(sm.temperature == 1.0).item()):
+            return False
+        # No logprobs (would need full-vocab logsumexp).
+        if sm.max_num_logprobs is not None or sm.logprob_token_ids:
+            return False
+        # No penalties / bad words / allowed-token mask.
+        if not sm.no_penalties or sm.bad_words_token_ids or \
+                sm.allowed_token_ids_mask is not None:
+            return False
+        # No ACTIVE non-argmax-invariant logitsprocs we can't reproduce locally
+        # (min_tokens, logit_bias, thinking-budget). argmax-invariant ones (min_p)
+        # are fine to skip since temp=1/top_p=1/top_k=-1 makes them inert here.
+        lp = sm.logitsprocs
+        for proc in lp.non_argmax_invariant:
+            if getattr(proc, "min_toks", None):
+                return False
+            if getattr(proc, "biases", None):
+                return False
+            if getattr(proc, "_state", None):
+                return False
+        return True
+
+    def _dist_sample(self, sample_hidden_states) -> "SamplerOutput":
+        """Vocab-parallel Gumbel-max fast path. Returns SamplerOutput w/ no logprobs."""
+        # Per-step seed shared across TP ranks (lockstep execution => identical on
+        # every rank), advanced each step so the Gumbel field varies over time.
+        step_seed = getattr(self, "_dist_step_seed", 0)
+        if step_seed == 0:
+            logger.info("[DIST_SAMPLE] fused gumbel vocab-parallel fast path ENGAGED")
+        self._dist_step_seed = step_seed + 1
+        tokens = self.model.logits_processor.gumbel_argmax_tokens(
+            self.model.lm_head, sample_hidden_states, step_seed,
+        )
+        sampled = tokens.to(torch.int32).unsqueeze(-1)
+        return SamplerOutput(sampled_token_ids=sampled, logprobs_tensors=None)
+
     def _bookkeeping_sync(
         self,
         scheduler_output: "SchedulerOutput",
@@ -4431,10 +4483,18 @@ class GPUModelRunner(
                     )
 
                 sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states)
+
+                if self._dist_sample_eligible(spec_decode_metadata):
+                    self._dist_sample_chosen = True
+                    logits = None  # fast path computes local logits in sampler
+                else:
+                    self._dist_sample_chosen = False
+                    logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
+                # dist-sample fast path only applies to the primary branch above.
+                self._dist_sample_chosen = False
 
                 sample_hidden_states = hidden_states[logits_indices]
                 if not get_pp_group().is_last_rank:
@@ -4535,7 +4595,13 @@ class GPUModelRunner(
             )
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
+            # The eligibility decision above set self._dist_sample_chosen exactly
+            # when the fast path was taken (logits is None on those steps).
+            if getattr(self, "_dist_sample_chosen", False):
+                self._dist_sample_chosen = False
+                sampler_output = self._dist_sample(sample_hidden_states)
+            else:
+                sampler_output = self._sample(logits, spec_decode_metadata)
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
