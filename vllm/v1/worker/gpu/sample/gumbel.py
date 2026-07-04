@@ -242,3 +242,72 @@ def gumbel_sample(
     max_block_idx = local_max.argmax(dim=-1, keepdim=True)
     sampled = local_argmax.gather(dim=-1, index=max_block_idx).view(-1)
     return sampled
+
+
+@triton.jit
+def _dist_gumbel_packed_kernel(
+    logits_ptr,
+    logits_stride,
+    out_packed_ptr,
+    out_packed_stride,
+    seed,
+    vocab_start,
+    total_vocab,
+    vocab_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    # Fused Gumbel-max over one TP vocab shard -> packed int64, one pass.
+    token_idx = tl.program_id(0)
+    block_idx = tl.program_id(1)
+    block = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = block < vocab_size
+    logits = tl.load(
+        logits_ptr + token_idx * logits_stride + block,
+        mask=mask,
+        other=float("-inf"),
+    ).to(tl.float64)
+
+    # Counter unique per (token, GLOBAL vocab position); same seed on all ranks.
+    global_pos = (block + vocab_start).to(tl.int64)
+    offset = token_idx.to(tl.int64) * total_vocab + global_pos
+    u = tl_rand64(seed, offset, includes_zero=False)
+    gumbel = -tl.log(-tl.log(u))
+    perturbed = tl.where(mask, logits + gumbel, float("-inf"))
+
+    value, idx = tl.max(perturbed, axis=0, return_indices=True)
+    global_idx = (block_idx * BLOCK_SIZE + idx + vocab_start).to(tl.int64)
+
+    # Pack (value, index) -> positive sortable int64 (matches the host-side layout
+    # in LogitsProcessor.gumbel_argmax_tokens). float32 monotonic key in high bits.
+    val_i32 = value.to(tl.float32).to(tl.int32, bitcast=True)
+    key_i32 = tl.where(val_i32 >= 0, val_i32 | (-2147483648), ~val_i32)
+    key_u32 = key_i32.to(tl.int64) & 0xFFFFFFFF  # unsigned-monotonic image
+    key31 = key_u32 >> 1  # 31-bit key, positive
+    packed = (key31 << 31) | (global_idx & 0x7FFFFFFF)
+    tl.store(out_packed_ptr + token_idx * out_packed_stride + block_idx, packed)
+
+
+def dist_gumbel_local_packed(
+    logits: torch.Tensor,  # [num_tokens, shard_vocab_size], float32
+    seed: int,
+    vocab_start: int,
+    total_vocab: int,
+) -> torch.Tensor:
+    # Vocab-parallel Gumbel-max local argmax, returned as a packed int64.
+    num_tokens, vocab_size = logits.shape
+    BLOCK_SIZE = 1024
+    num_blocks = triton.cdiv(vocab_size, BLOCK_SIZE)
+    out_packed = logits.new_empty(num_tokens, num_blocks, dtype=torch.int64)
+    _dist_gumbel_packed_kernel[(num_tokens, num_blocks)](
+        logits,
+        logits.stride(0),
+        out_packed,
+        out_packed.stride(0),
+        seed,
+        vocab_start,
+        total_vocab,
+        vocab_size,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    # int64 max over blocks (monotonic packing => value-then-index winner).
+    return out_packed.max(dim=-1).values

@@ -155,6 +155,54 @@ class LogitsProcessor(PluggableLayer):
         top_tokens = gathered[:, :, 1].gather(dim=-1, index=max_rank_idx)
         return top_tokens.squeeze(-1).to(torch.int64)
 
+    def gumbel_argmax_tokens(
+        self,
+        lm_head: VocabParallelEmbedding,
+        hidden_states: torch.Tensor,
+        step_seed: int,
+        embedding_bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Vocab-parallel Gumbel-max sample WITHOUT all-gathering full logits.
+        temp=1, top_p=1, top_k=-1 only. Equivalent in distribution to multinomial
+        sampling over softmax(full_logits); no normalizer needed. 
+        """
+        from vllm.distributed import get_tp_group
+        from vllm.v1.worker.gpu.sample.gumbel import dist_gumbel_local_packed
+
+        tp_size = get_tensor_model_parallel_world_size()
+
+        # Local shard logits. float32 for stable noise add + compare.
+        logits = lm_head.quant_method.apply(
+            lm_head, hidden_states, bias=embedding_bias
+        ).to(torch.float32)
+        if self.soft_cap is not None:
+            logits = torch.tanh(logits / self.soft_cap) * self.soft_cap
+        if self.scale != 1.0:
+            logits = logits * self.scale
+
+        # Mask padding entries beyond org_vocab_size on this shard.
+        num_pad = lm_head.shard_indices.num_org_vocab_padding
+        if num_pad > 0:
+            logits[..., -num_pad:] = -float("inf")
+
+        vocab_start = lm_head.shard_indices.org_vocab_start_index
+
+        # int64 MAX: pack (31-bit value key)<<31 | global_index, so a plain MAX
+        # yields the value-then-index winner. 
+        # vLLM's tensor_model_parallel_all_reduce is SUM-only, so use the raw TP group.
+        packed = dist_gumbel_local_packed(
+            logits, int(step_seed), int(vocab_start), int(self.org_vocab_size)
+        )
+        if tp_size == 1:
+            return packed & 0x7FFFFFFF
+
+        import torch.distributed as dist
+
+        dist.all_reduce(
+            packed, op=dist.ReduceOp.MAX, group=get_tp_group().device_group
+        )
+        return packed & 0x7FFFFFFF
+
     def extra_repr(self) -> str:
         s = f"vocab_size={self.vocab_size}"
         s += f", org_vocab_size={self.org_vocab_size}"

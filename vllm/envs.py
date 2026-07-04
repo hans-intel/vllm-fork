@@ -276,6 +276,7 @@ if TYPE_CHECKING:
     VLLM_XPU_FP8_ALLREDUCE: bool = False
     VLLM_XPU_FP8_ALLREDUCE_SCALE: float = 128.0
     VLLM_XPU_FP8_ALLREDUCE_MIN_TOKENS: int = 512
+    VLLM_ENABLE_DIST_SAMPLE: bool = False
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
@@ -1889,6 +1890,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_XPU_FP8_ALLREDUCE_MIN_TOKENS": lambda: int(
         os.getenv("VLLM_XPU_FP8_ALLREDUCE_MIN_TOKENS", "512")
     ),
+    # Vocab-parallel Gumbel-max distributed sampling fast path.
+    "VLLM_ENABLE_DIST_SAMPLE": lambda: os.environ.get("VLLM_ENABLE_DIST_SAMPLE", "0")
+    == "1",
     # Enable simple KV offload.
     "VLLM_USE_SIMPLE_KV_OFFLOAD": lambda: bool(
         int(os.getenv("VLLM_USE_SIMPLE_KV_OFFLOAD", "0"))
