@@ -287,6 +287,84 @@ def _dist_gumbel_packed_kernel(
     tl.store(out_packed_ptr + token_idx * out_packed_stride + block_idx, packed)
 
 
+@triton.jit
+def _dist_gumbel_validx_kernel(
+    logits_ptr,
+    logits_stride,
+    out_val_ptr,
+    out_val_stride,
+    out_idx_ptr,
+    out_idx_stride,
+    seed,
+    vocab_start,
+    total_vocab,
+    vocab_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Same as _dist_gumbel_packed_kernel, but stores the per-block winner as sparate 
+    (value fp32, global_index fp32) for fp32 allreduce """
+    token_idx = tl.program_id(0)
+    block_idx = tl.program_id(1)
+    block = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = block < vocab_size
+    logits = tl.load(
+        logits_ptr + token_idx * logits_stride + block,
+        mask=mask,
+        other=float("-inf"),
+    ).to(tl.float64)
+
+    global_pos = (block + vocab_start).to(tl.int64)
+    offset = token_idx.to(tl.int64) * total_vocab + global_pos
+    u = tl_rand64(seed, offset, includes_zero=False)
+    gumbel = -tl.log(-tl.log(u))
+    perturbed = tl.where(mask, logits + gumbel, float("-inf"))
+
+    value, idx = tl.max(perturbed, axis=0, return_indices=True)
+    global_idx = (block_idx * BLOCK_SIZE + idx + vocab_start).to(tl.int64)
+
+    tl.store(
+        out_val_ptr + token_idx * out_val_stride + block_idx,
+        value.to(tl.float32),
+    )
+    tl.store(
+        out_idx_ptr + token_idx * out_idx_stride + block_idx,
+        global_idx.to(tl.float32),
+    )
+
+
+def dist_gumbel_local_validx(
+    logits: torch.Tensor,  # [num_tokens, shard_vocab_size], float32
+    seed: int,
+    vocab_start: int,
+    total_vocab: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Vocab-parallel Gumbel-max local winner, returned as separate fp32 tensors.
+    num_tokens, vocab_size = logits.shape
+    BLOCK_SIZE = 1024
+    num_blocks = triton.cdiv(vocab_size, BLOCK_SIZE)
+    out_val = logits.new_empty(num_tokens, num_blocks, dtype=torch.float32)
+    out_idx = logits.new_empty(num_tokens, num_blocks, dtype=torch.float32)
+    _dist_gumbel_validx_kernel[(num_tokens, num_blocks)](
+        logits,
+        logits.stride(0),
+        out_val,
+        out_val.stride(0),
+        out_idx,
+        out_idx.stride(0),
+        seed,
+        vocab_start,
+        total_vocab,
+        vocab_size,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    # Per-token local winner across blocks (fp32 argmax, exact gather of index).
+    best_block = out_val.argmax(dim=-1, keepdim=True)
+    value = out_val.gather(dim=-1, index=best_block).view(-1)
+    global_idx = out_idx.gather(dim=-1, index=best_block).view(-1)
+    return value, global_idx
+
+
+
 def dist_gumbel_local_packed(
     logits: torch.Tensor,  # [num_tokens, shard_vocab_size], float32
     seed: int,

@@ -187,6 +187,7 @@ class LogitsProcessor(PluggableLayer):
         temp=1, top_p=1, top_k=-1 only. Equivalent in distribution to multinomial
         sampling over softmax(full_logits); no normalizer needed.
         """
+        import vllm.envs as envs
         from vllm.distributed import get_tp_group
         from vllm.v1.worker.gpu.sample.gumbel import dist_gumbel_local_packed
 
@@ -211,9 +212,29 @@ class LogitsProcessor(PluggableLayer):
         # MinTokens: censor stop/EOS tokens on the owning shard before argmax.
         self._apply_min_tokens_mask(logits, vocab_start, min_tokens_mask)
 
-        # int64 MAX: pack (31-bit value key)<<31 | global_index, so a plain MAX
-        # yields the value-then-index winner. 
-        # vLLM's tensor_model_parallel_all_reduce is SUM-only, so use the raw TP group.
+        # fp32-allreduce: separate (value, global_idx) fp32 + 0-fill SUM all-reduce. 
+        # Faster than int64 max
+        if tp_size > 1 and envs.VLLM_ENABLE_DIST_SAMPLE_FP32_REDUCE:
+            from vllm.v1.worker.gpu.sample.gumbel import dist_gumbel_local_validx
+            import torch.distributed as dist
+
+            B = logits.shape[0]
+            value, global_idx = dist_gumbel_local_validx(
+                logits, int(step_seed), int(vocab_start), int(self.org_vocab_size)
+            )
+            rank = get_tp_group().rank_in_group
+            table = logits.new_zeros(B, tp_size, 2)  # fp32
+            table[:, rank, 0] = value
+            table[:, rank, 1] = global_idx
+            dist.all_reduce(
+                table, op=dist.ReduceOp.SUM, group=get_tp_group().device_group
+            )
+            best = table[:, :, 0].argmax(dim=-1, keepdim=True)
+            return table[:, :, 1].gather(-1, best).squeeze(-1).to(torch.int64)
+
+        # int64-allreduce: pack (31-bit value key)<<31 | global_index, so a plain MAX
+        # yields the value-then-index winner. Current tensor_model_parallel_all_reduce 
+        # is SUM-only, so use the raw TP group.
         packed = dist_gumbel_local_packed(
             logits, int(step_seed), int(vocab_start), int(self.org_vocab_size)
         )
