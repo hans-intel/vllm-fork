@@ -155,16 +155,37 @@ class LogitsProcessor(PluggableLayer):
         top_tokens = gathered[:, :, 1].gather(dim=-1, index=max_rank_idx)
         return top_tokens.squeeze(-1).to(torch.int64)
 
+    @staticmethod
+    def _apply_min_tokens_mask(
+        logits: torch.Tensor,
+        vocab_start: int,
+        min_tokens_mask: tuple[torch.Tensor, torch.Tensor] | None,
+    ) -> None:
+        # Set stop/EOS-token logits to -inf for under-min requests, in place.
+        if min_tokens_mask is None:
+            return
+        rows, global_tok_ids = min_tokens_mask
+        if rows.numel() == 0:
+            return
+        local_cols = global_tok_ids.to(torch.int64) - vocab_start
+        in_shard = (local_cols >= 0) & (local_cols < logits.shape[-1])
+        if not bool(in_shard.any()):
+            return
+        sel_rows = rows.to(torch.int64)[in_shard]
+        sel_cols = local_cols[in_shard]
+        logits[sel_rows, sel_cols] = -float("inf")
+
     def gumbel_argmax_tokens(
         self,
         lm_head: VocabParallelEmbedding,
         hidden_states: torch.Tensor,
         step_seed: int,
         embedding_bias: torch.Tensor | None = None,
+        min_tokens_mask: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        """Vocab-parallel Gumbel-max sample WITHOUT all-gathering full logits.
+        """ Vocab-parallel Gumbel-max sample WITHOUT all-gathering full logits.
         temp=1, top_p=1, top_k=-1 only. Equivalent in distribution to multinomial
-        sampling over softmax(full_logits); no normalizer needed. 
+        sampling over softmax(full_logits); no normalizer needed.
         """
         from vllm.distributed import get_tp_group
         from vllm.v1.worker.gpu.sample.gumbel import dist_gumbel_local_packed
@@ -186,6 +207,9 @@ class LogitsProcessor(PluggableLayer):
             logits[..., -num_pad:] = -float("inf")
 
         vocab_start = lm_head.shard_indices.org_vocab_start_index
+
+        # MinTokens: censor stop/EOS tokens on the owning shard before argmax.
+        self._apply_min_tokens_mask(logits, vocab_start, min_tokens_mask)
 
         # int64 MAX: pack (31-bit value key)<<31 | global_index, so a plain MAX
         # yields the value-then-index winner. 

@@ -3624,17 +3624,25 @@ class GPUModelRunner(
                 sm.allowed_token_ids_mask is not None:
             return False
         # No ACTIVE non-argmax-invariant logitsprocs we can't reproduce locally
-        # (min_tokens, logit_bias, thinking-budget). argmax-invariant ones (min_p)
-        # are fine to skip since temp=1/top_p=1/top_k=-1 makes them inert here.
         lp = sm.logitsprocs
         for proc in lp.non_argmax_invariant:
             if getattr(proc, "min_toks", None):
-                return False
+                continue
             if getattr(proc, "biases", None):
                 return False
             if getattr(proc, "_state", None):
                 return False
         return True
+
+    def _min_tokens_mask_slice(self):
+        """If a MinTokens logits processor is active, return its precomputed
+        (row_indices, global_token_ids) device tensors to mask to -inf; else None.
+        """
+        sm = self.input_batch.sampling_metadata
+        for proc in sm.logitsprocs.non_argmax_invariant:
+            if getattr(proc, "min_toks", None):
+                return getattr(proc, "logits_slice", None)
+        return None
 
     def _dist_sample(self, sample_hidden_states) -> "SamplerOutput":
         """Vocab-parallel Gumbel-max fast path. Returns SamplerOutput w/ no logprobs."""
@@ -3644,8 +3652,10 @@ class GPUModelRunner(
         if step_seed == 0:
             logger.info("[DIST_SAMPLE] fused gumbel vocab-parallel fast path ENGAGED")
         self._dist_step_seed = step_seed + 1
+        min_tokens_mask = self._min_tokens_mask_slice()
         tokens = self.model.logits_processor.gumbel_argmax_tokens(
             self.model.lm_head, sample_hidden_states, step_seed,
+            min_tokens_mask=min_tokens_mask,
         )
         sampled = tokens.to(torch.int32).unsqueeze(-1)
         return SamplerOutput(sampled_token_ids=sampled, logprobs_tensors=None)
