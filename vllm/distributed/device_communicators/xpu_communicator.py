@@ -6,11 +6,24 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.triton_utils import HAS_TRITON, tl, triton
 
 from .base_device_communicator import DeviceCommunicatorBase
 
 logger = init_logger(__name__)
+
+_FP8_DTYPE = torch.float8_e4m3fn
+
+
+@triton.jit
+def _fp8_dequant_kernel(gathered_ptr, scale, out_ptr, n_elem, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n_elem
+    v = tl.load(gathered_ptr + offs, mask=mask).to(tl.float32)
+    tl.store(out_ptr + offs, (v * scale).to(tl.bfloat16), mask=mask)
 
 
 class XpuCommunicator(DeviceCommunicatorBase):
@@ -43,9 +56,61 @@ class XpuCommunicator(DeviceCommunicatorBase):
                 logger.info("Using AgRs manager on XPU device.")
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        if envs.VLLM_XPU_FP8_ALLREDUCE and self._fp8_allreduce_applicable(input_):
+            return self._fp8_all_reduce(input_)
         output = input_.clone()
         dist.all_reduce(output, group=self.device_group)
         return output
+
+    def _fp8_allreduce_applicable(self, input_: torch.Tensor) -> bool:
+        # 1) Only worthwhile for the large bf16 activation all-reduces, 
+        # 2) num_tokens % num_ranks == 0 (reduce-scatter requirement)
+        # 3) num_tokens > MIN TOKENS
+        # 4) per-rank shard % 4 == 0 (int32-packed fp8 all-gather)
+        if not (
+            HAS_TRITON
+            and input_.dtype == torch.bfloat16
+            and input_.is_contiguous()
+            and input_.dim() >= 1
+            and input_.shape[0] >= envs.VLLM_XPU_FP8_ALLREDUCE_MIN_TOKENS
+            and input_.shape[0] % self.world_size == 0
+        ):
+            return False
+        shard_numel = input_.numel() // self.world_size
+        return shard_numel % 4 == 0
+
+    def _fp8_all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        # bf16 reduce-scatter (accurate sum) + fp8 all-gather + fused dequant.
+
+        world_size = self.world_size
+        x = input_.contiguous()
+        scale = envs.VLLM_XPU_FP8_ALLREDUCE_SCALE
+        inv_scale = 1.0 / scale
+
+        # 1. Accurate sum in bf16, sharded across ranks
+        shard_shape = (x.shape[0] // world_size,) + tuple(x.shape[1:])
+        shard = torch.empty(shard_shape, dtype=torch.bfloat16, device=x.device)
+        dist.reduce_scatter_tensor(shard, x, group=self.device_group)
+
+        # 2. Quantize the summed shard to fp8 with the static scale 
+        shard_fp8 = (shard.float() * inv_scale).to(_FP8_DTYPE).contiguous()
+
+        # 3. All-gather the fp8 shards 
+        shard_i32 = shard_fp8.view(-1).view(torch.int32)
+        gathered_i32 = torch.empty(
+            shard_i32.numel() * world_size, dtype=torch.int32, device=x.device
+        )
+        dist.all_gather_into_tensor(gathered_i32, shard_i32, group=self.device_group)
+        gathered_fp8 = gathered_i32.view(_FP8_DTYPE)
+
+        # 4. Fused Triton dequant over the full-size gathered tensor.
+        out = torch.empty(x.shape, dtype=torch.bfloat16, device=x.device)
+        n = gathered_fp8.numel()
+        grid = lambda meta: (triton.cdiv(n, meta["BLOCK"]),)  # noqa: E731
+        _fp8_dequant_kernel[grid](
+            gathered_fp8.view(-1), scale, out.view(-1), n, BLOCK=2048
+        )
+        return out
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
         world_size = self.world_size
